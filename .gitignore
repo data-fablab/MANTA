@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# Virtual environment
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Generated outputs (regenerable via notebooks)
+output/
+data/
+models/
+
+# Claude Code local config
+.claude/
+
+# Environment
+.env
+.env.local

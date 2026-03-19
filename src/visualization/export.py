@@ -892,6 +892,7 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
     from OCP.BRepCheck import BRepCheck_Analyzer
     from OCP.GProp import GProp_GProps
     from OCP.BRepGProp import BRepGProp
+    from .step_booleans import robust_fuse
 
     p = params
 
@@ -926,11 +927,14 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
     trsf.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)))
     left_solid = BRepBuilderAPI_Transform(right_solid, trsf, True).Shape()
 
-    # ── 2e. Fuse both halves ──
-    fuse_op = BRepAlgoAPI_Fuse(right_solid, left_solid)
-    fuse_op.Build()
-    if not fuse_op.IsDone():
-        warnings.warn("Boolean fuse failed, falling back to sewing")
+    # ── 2e. Fuse both halves (robust pipeline) ──
+    fused_result, fuse_msg = robust_fuse(
+        right_solid, left_solid, label="v2-halves",
+    )
+    if fused_result is not None:
+        full_solid = fused_result
+    else:
+        warnings.warn("Robust fuse failed (%s), falling back to sewing" % fuse_msg)
         from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
         from OCP.TopoDS import TopoDS
 
@@ -940,8 +944,6 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
         sew.Perform()
         sewn = sew.SewedShape()
         full_solid = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn)).Solid()
-    else:
-        full_solid = fuse_op.Shape()
 
     # ── 2f. Validate topology ──
     analyzer = BRepCheck_Analyzer(full_solid)
@@ -1169,6 +1171,8 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     from OCP.TopoDS import TopoDS_Compound
     from OCP.BRep import BRep_Builder
 
+    from .step_booleans import robust_fuse_and_cut, compute_volume, is_valid_solid
+
     from ..propulsion.duct_geometry import (
         compute_duct_placement, validate_duct_clearance,
         build_sduct_geometry, build_edf_housing, build_exhaust_geometry,
@@ -1346,45 +1350,28 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
         warnings.warn("Shell build failed: %s" % e)
 
     # ==================================================================
-    # Step 6: Boolean integration — Fuse(OML, Shell) then Cut(Duct)
+    # Step 6: Boolean integration — Robust pipeline
     # ==================================================================
-    # Use BOPAlgo_Builder with fuzzy tolerance for robust booleans.
-    print("[v3] 6/6  Boolean: Fuse(OML, Shell) + Cut(Duct)...")
+    # Uses step_booleans.py: heal → unify → CellsBuilder → validate
+    # with cascading fallbacks (CellsBuilder → Standard → Splitter).
+    print("[v3] 6/6  Boolean: robust Fuse(OML, Shell) + Cut(Duct)...")
     result_solid = oml_solid
     bool_ok = False
+    bool_method = "none"
 
     if shell_solid is not None and duct_solid is not None:
         try:
-            from OCP.BOPAlgo import BOPAlgo_Builder
-
-            # Step 6a: Fuse OML + Shell
-            fuse_builder = BOPAlgo_Builder()
-            fuse_builder.AddArgument(oml_solid)
-            fuse_builder.AddArgument(shell_solid)
-            fuse_builder.SetFuzzyValue(0.05)  # 50 microns
-            fuse_builder.SetRunParallel(True)
-            fuse_builder.Perform()
-
-            if not fuse_builder.HasErrors():
-                fused = fuse_builder.Shape()
-                vol_f = GProp_GProps()
-                BRepGProp.VolumeProperties_s(fused, vol_f)
-                print("[v3]      Fuse OK (vol=%.1f cm3)" % (abs(vol_f.Mass()) / 1e6))
-
-                # Step 6b: Cut duct interior
-                cut_op = BRepAlgoAPI_Cut(fused, duct_solid)
-                cut_op.SetFuzzyValue(0.05)
-                cut_op.Build()
-                if cut_op.IsDone():
-                    result_solid = cut_op.Shape()
-                    vol_c = GProp_GProps()
-                    BRepGProp.VolumeProperties_s(result_solid, vol_c)
-                    bool_ok = True
-                    print("[v3]      Cut OK (vol=%.1f cm3)" % (abs(vol_c.Mass()) / 1e6))
-                else:
-                    warnings.warn("Cut failed — exporting multi-body fallback")
+            integrated, status = robust_fuse_and_cut(
+                oml_solid, shell_solid, duct_solid,
+                label="v3",
+            )
+            if integrated is not None:
+                result_solid = integrated
+                bool_ok = True
+                bool_method = status
+                print("[v3]      Boolean OK: %s" % status)
             else:
-                warnings.warn("Fuse failed — exporting multi-body fallback")
+                warnings.warn("Boolean pipeline failed: %s — exporting multi-body fallback" % status)
         except Exception as e:
             warnings.warn("Boolean failed: %s — exporting multi-body fallback" % e)
 
@@ -1417,7 +1404,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     file_size_kb = os.path.getsize(path) / 1024
 
     if bool_ok:
-        compound_mode = "integrated solid (fuse+cut)"
+        compound_mode = "integrated solid (%s)" % bool_method
     else:
         compound_mode = "multi-body fallback: OML"
         if shell_solid is not None:

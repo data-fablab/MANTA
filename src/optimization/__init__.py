@@ -1,6 +1,7 @@
 # Lazy imports to avoid pulling torch when only database is needed
 from .database import EvaluationDatabase
 from .candidates import generate_candidates
+from .catalog import DesignCatalog, CatalogEntry
 
 
 def run_optimization(*args, **kwargs):

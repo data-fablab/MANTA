@@ -5,7 +5,12 @@ Extends v1 plots with center-body + outer wing views and propulsion balance.
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend: save to file, no blocking window
+if matplotlib.get_backend().lower() in ("agg", ""):
+    try:
+        # Don't override if running inside Jupyter (inline backend)
+        get_ipython()  # raises NameError outside IPython/Jupyter
+    except NameError:
+        matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from ..parameterization.design_variables import BWBParams
 from ..parameterization.bwb_aircraft import (

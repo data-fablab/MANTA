@@ -1,8 +1,8 @@
 # nEUROn v2 — BWB Flying Wing Optimizer
 
 Multi-disciplinary design optimization framework for a Blended Wing Body (BWB) flying wing UAV.
-Combines parametric geometry, aerodynamic analysis (VLM), surrogate modeling (PyTorch), and CAD export
-to produce an optimized aircraft design ready for manufacturing.
+Combines parametric geometry, aerodynamic analysis (VLM), surrogate modeling (PyTorch), CAD export,
+and multi-criteria design exploration to produce optimized aircraft designs ready for manufacturing.
 
 ## Pipeline
 
@@ -24,6 +24,10 @@ to produce an optimized aircraft design ready for manufacturing.
 06_validation               Re-evaluation with full VLM (AVL)
         |
 07_export_cad               STL, STEP, profiles + splines export
+        |
+08_propulsion_integration   EDF duct placement, clearance, STEP booleans
+        |
+09_design_catalog           Multi-design trade-off analysis & batch export
 ```
 
 ## Project Structure
@@ -33,11 +37,12 @@ nEUROn_v2/
   src/
     parameterization/       30-variable BWB geometry (design_variables.py, bwb_aircraft.py)
     aero/                   Aerodynamic evaluation (AVL runner, drag model, mission)
-    propulsion/             EDF motor model (thrust, power, endurance)
+    propulsion/             EDF motor model, duct geometry, duct aerodynamics
     surrogate/              PyTorch ensemble surrogate (model, features, reconstruct)
-    optimization/           Problem formulation, candidates, evaluation database
-    visualization/          CAD export (STL, STEP, profiles) and plotting
-  notebooks/                Jupyter notebooks (pipeline steps 01-07)
+    optimization/           Problem formulation, candidates, database, design catalog
+    evaluation/             Manufacturability scoring (geometric complexity metrics)
+    visualization/          CAD export (STL, STEP), robust booleans, comparison plots
+  notebooks/                Jupyter notebooks (pipeline steps 01-09)
   scripts/                  Standalone AVL utilities
   requirements.txt          Python dependencies
 ```
@@ -67,20 +72,47 @@ AVL (Athena Vortex Lattice) must be available for aerodynamic evaluation.
 
 ## CAD Export
 
-Three complementary export modes in `src/visualization/export.py`:
+Four export modes in `src/visualization/export.py`:
 
 | Format | Function | Description |
 |--------|----------|-------------|
 | **STL** | `export_aircraft_stl()` | Triangulated mesh for visualization / 3D printing |
 | **STEP v1** | `export_aircraft_step()` | Single BSpline surface (approximation) |
 | **STEP v2** | `export_aircraft_step_v2()` | Watertight solid via ThruSections loft |
+| **STEP v3** | `export_aircraft_step_v3()` | OML + propulsion duct with boolean integration |
 
-STEP v2 features:
+STEP v2/v3 features:
 - Exact interpolation through section wires (zero deviation)
 - Periodic BSpline wires with native cosine spacing (0.05 mm fidelity)
 - C2 continuity, chord-length parametrization
-- Mirror + boolean fuse for full symmetric aircraft
+- Robust STEP booleans via `step_booleans.py`: ShapeFix healing +
+  BOPAlgo_CellsBuilder with cascading fallbacks (preserves full NURBS quality)
 - Validation: topology check, volume, surface area, max deviation
+
+## Design Catalog
+
+The design catalog (`src/optimization/catalog.py`) enables multi-criteria design exploration:
+
+- **Named designs**: baseline (defaults), optimized (best_x.npy), Pareto-optimal, custom
+- **α-blending**: interpolate between any two designs in the 30D space
+- **Manufacturability scoring** (`src/evaluation/manufacturability.py`): composite score [0-1]
+  based on twist/dihedral gradients, minimum thickness, taper severity, mold complexity
+- **Comparison plots** (`src/visualization/comparison.py`): Pareto plot, radar chart,
+  planform overlay, summary table
+- **Batch STEP export**: export all catalog designs for downstream FEA/manufacturing pipeline
+
+```python
+from src.optimization.catalog import DesignCatalog
+
+catalog = DesignCatalog()
+catalog.add_baseline()
+catalog.add_optimized('output/best_x.npy')
+catalog.interpolate('baseline', 'optimized', [0.2, 0.4, 0.6, 0.8])
+catalog.evaluate_aero(use_surrogate=True)
+catalog.evaluate_manufacturability()
+catalog.export_all_step('output/catalog/')
+catalog.save('output/catalog.json')
+```
 
 ## Optimized Design
 
@@ -110,9 +142,10 @@ Propulsion (EDF 70mm):
 
 ## Usage
 
-Run notebooks in order (01 through 07). Each notebook documents its inputs, outputs,
-and intermediate results. The final notebook (`07_export_cad`) produces manufacturing-ready
-CAD files in `output/cad_export/`.
+Run notebooks in order (01 through 09). Each notebook documents its inputs, outputs,
+and intermediate results. Notebook `07_export_cad` produces manufacturing-ready
+CAD files, `08_propulsion_integration` adds the EDF duct, and `09_design_catalog`
+enables multi-criteria trade-off analysis between designs.
 
 ```python
 from src.visualization.export import export_aircraft_step_v2

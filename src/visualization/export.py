@@ -27,7 +27,9 @@ from ..parameterization.bwb_aircraft import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 def export_aircraft_stl(params: BWBParams, path: str, n_profile: int = 30,
-                        n_interp: int = 8):
+                        n_interp: int = 8,
+                        include_propulsion: bool = False,
+                        edf: 'EDFSpec | None' = None):
     """Export complete BWB aircraft (body + outer wing) as a single STL file.
 
     Uses cubic spline interpolation in the spanwise direction to produce
@@ -43,6 +45,12 @@ def export_aircraft_stl(params: BWBParams, path: str, n_profile: int = 30,
     n_interp : int
         Number of interpolated sections between each pair of defining
         stations. Higher = smoother surface (8 is a good default).
+    include_propulsion : bool
+        If True, add propulsion duct geometry (intake, S-duct, nozzle)
+        to the STL mesh. Requires edf to be provided.
+    edf : EDFSpec or None
+        EDF specification for propulsion geometry. Required if
+        include_propulsion is True. Defaults to EDF_70MM.
 
     Returns
     -------
@@ -92,6 +100,14 @@ def export_aircraft_stl(params: BWBParams, path: str, n_profile: int = 30,
 
     # Root cap (centerline, y=0)
     _cap_section(dense_right[0], triangles, flip=True)
+
+    # Propulsion duct geometry
+    if include_propulsion:
+        from ..propulsion.duct_geometry import build_propulsion_mesh
+        from ..propulsion.edf_model import EDF_70MM
+        prop_edf = edf if edf is not None else EDF_70MM
+        prop_tris = build_propulsion_mesh(params, prop_edf, n_profile=32)
+        triangles.extend(prop_tris)
 
     # Create STL mesh
     stl_obj = stl_mesh.Mesh(np.zeros(len(triangles), dtype=stl_mesh.Mesh.dtype))
@@ -243,7 +259,9 @@ def _build_wing_sections(params: BWBParams, n_profile: int) -> list[np.ndarray]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def export_cad_profiles(params: BWBParams, output_dir: str,
-                        n_profile: int = 40, n_spline: int = 50):
+                        n_profile: int = 40, n_spline: int = 50,
+                        include_propulsion: bool = False,
+                        edf: 'EDFSpec | None' = None):
     """Export flat airfoil profiles + LE/TE splines for CAD loft.
 
     Creates:
@@ -442,6 +460,52 @@ def export_cad_profiles(params: BWBParams, output_dir: str,
     _save_spline_csv(out / "spline_le_left.csv", le_spline_left[::-1], "Leading Edge Left")
     _save_spline_csv(out / "spline_te_left.csv", te_spline_left[::-1], "Trailing Edge Left")
 
+    # ── Propulsion duct profiles ──
+    propulsion_data = None
+    if include_propulsion:
+        from ..propulsion.duct_geometry import (
+            compute_duct_placement, get_duct_profiles, get_duct_centerline_csv,
+        )
+        from ..propulsion.edf_model import EDF_70MM
+
+        prop_edf = edf if edf is not None else EDF_70MM
+        placement = compute_duct_placement(p, prop_edf)
+        duct_profiles = get_duct_profiles(placement, n_profile=40)
+
+        # Save duct cross-section profiles
+        duct_profile_files = []
+        for i, (name, cs) in enumerate(duct_profiles.items()):
+            dat_name = f"duct_{i:02d}_{name}.dat"
+            dat_path = prof_dir / dat_name
+            with open(dat_path, "w") as f:
+                f.write(f"nEUROn_v2 duct {name} (meters, local frame)\n")
+                for h, v in cs:
+                    f.write(f"  {h:.6f}  {v:.6f}\n")
+            duct_profile_files.append(dat_name)
+
+        # Save duct centerline
+        cl = get_duct_centerline_csv(placement, n_pts=50)
+        _save_spline_csv(out / "duct_centerline.csv", cl, "Duct Centerline")
+
+        propulsion_data = {
+            "edf_name": prop_edf.name,
+            "fan_diameter_m": prop_edf.fan_diameter,
+            "duct_od_m": prop_edf.duct_outer_diameter,
+            "intake_x_frac": placement.intake_x_frac,
+            "fan_x_frac": placement.fan_x_frac,
+            "exhaust_x_frac": placement.exhaust_x_frac,
+            "intake_x_m": placement.intake_x,
+            "intake_z_m": placement.intake_z,
+            "fan_x_m": placement.fan_x,
+            "fan_z_m": placement.fan_z,
+            "exhaust_x_m": placement.exhaust_x,
+            "exhaust_z_m": placement.exhaust_z,
+            "exhaust_width_m": placement.exhaust_width,
+            "exhaust_height_m": placement.exhaust_height,
+            "duct_profile_files": duct_profile_files,
+            "duct_centerline_file": "duct_centerline.csv",
+        }
+
     # ── Assembly JSON ──
     assembly = {
         "source": "nEUROn_v2 BWB optimizer",
@@ -472,9 +536,14 @@ def export_cad_profiles(params: BWBParams, output_dir: str,
             "6. Loft body profiles (body_00..body_02) along body LE spline\n"
             "7. Loft wing profiles (wing_00..wing_05) along wing LE spline\n"
             "8. body_02_blend and wing_00_root share the same airfoil (C0 continuity)\n"
-            "9. Mirror for the left side"
+            "9. Mirror for the left side\n"
+            "10. For propulsion: import duct profiles and loft along duct_centerline.csv\n"
+            "11. Boolean cut intake opening from body upper surface"
         ),
     }
+    if propulsion_data is not None:
+        assembly["propulsion"] = propulsion_data
+
     with open(out / "assembly.json", "w") as f:
         json.dump(assembly, f, indent=2)
 
@@ -926,3 +995,455 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
         "max_deviation_mm": round(max_dev, 4),
         "n_sections": len(all_sections),
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STEP v3 — integrated propulsion (OML + duct + boolean cuts)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_closed_wire(pts_3d_mm: np.ndarray, tol_mm: float = 1e-3):
+    """Build a closed BSpline wire from (n, 3) points in mm.
+
+    Unlike _make_periodic_wire which expects Selig airfoil convention,
+    this function works with any closed loop of points (duct cross-sections).
+    """
+    from OCP.TColgp import TColgp_HArray1OfPnt
+    from OCP.gp import gp_Pnt
+    from OCP.GeomAPI import GeomAPI_Interpolate
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
+
+    n = len(pts_3d_mm)
+    harray = TColgp_HArray1OfPnt(1, n)
+    for i in range(n):
+        harray.SetValue(i + 1, gp_Pnt(float(pts_3d_mm[i, 0]),
+                                        float(pts_3d_mm[i, 1]),
+                                        float(pts_3d_mm[i, 2])))
+
+    interp = GeomAPI_Interpolate(harray, True, tol_mm)  # periodic=True
+    interp.Perform()
+    if not interp.IsDone():
+        raise RuntimeError("GeomAPI_Interpolate failed for closed duct wire")
+
+    curve = interp.Curve()
+    edge = BRepBuilderAPI_MakeEdge(curve).Edge()
+    wire = BRepBuilderAPI_MakeWire(edge).Wire()
+    return wire
+
+
+def _loft_duct_solid(sections_3d: list[np.ndarray]) -> 'TopoDS_Shape':
+    """Loft a list of (n, 3) cross-section arrays (meters) into a solid.
+
+    Uses BRepOffsetAPI_ThruSections for smooth interpolation.
+    Returns an OCC solid shape.
+    """
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.Approx import Approx_ChordLength
+
+    loft = BRepOffsetAPI_ThruSections(True, False)  # solid=True, ruled=False
+    loft.SetMaxDegree(6)
+    loft.SetContinuity(GeomAbs_C2)
+    loft.SetParType(Approx_ChordLength)
+    loft.CheckCompatibility(True)
+
+    for sec in sections_3d:
+        pts_mm = sec * 1000.0  # meters → mm
+        wire = _make_closed_wire(pts_mm)
+        loft.AddWire(wire)
+
+    loft.Build()
+    if not loft.IsDone():
+        raise RuntimeError("Duct loft (ThruSections) failed")
+    return loft.Shape()
+
+
+def _make_cutting_box(center_mm, half_sizes_mm):
+    """Create an axis-aligned box for boolean cutting.
+
+    Parameters: center_mm=[cx,cy,cz], half_sizes_mm=[hx,hy,hz] in mm.
+    """
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+    cx, cy, cz = center_mm
+    hx, hy, hz = half_sizes_mm
+    return BRepPrimAPI_MakeBox(
+        gp_Pnt(cx - hx, cy - hy, cz - hz),
+        gp_Pnt(cx + hx, cy + hy, cz + hz),
+    ).Shape()
+
+
+def _make_cutting_prism(cross_section_mm, center_mm, extrude_mm=100.0):
+    """Create a cutting tool by extruding a 2D cross-section through the skin.
+
+    Builds a BRep face from a closed superellipse/ellipse cross-section,
+    then extrudes it along the Z-axis (both up and down) to fully
+    penetrate the OML skin.
+
+    Parameters
+    ----------
+    cross_section_mm : (n, 2) array
+        Closed cross-section [y, z_local] in mm (local frame).
+    center_mm : [cx, cy, cz]
+        3D center position in mm.
+    extrude_mm : float
+        Half-extrusion distance above and below center (default 100mm
+        ensures full skin penetration).
+
+    Returns
+    -------
+    TopoDS_Shape — solid prism for boolean cutting.
+    """
+    from OCP.gp import gp_Pnt, gp_Vec
+    from OCP.TColgp import TColgp_HArray1OfPnt
+    from OCP.GeomAPI import GeomAPI_Interpolate
+    from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge,
+                                     BRepBuilderAPI_MakeWire,
+                                     BRepBuilderAPI_MakeFace)
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+
+    cx, cy, cz = center_mm
+    cs = np.asarray(cross_section_mm)
+    n = len(cs)
+
+    # Build a closed wire in the YZ plane at x=cx
+    harray = TColgp_HArray1OfPnt(1, n)
+    for i in range(n):
+        harray.SetValue(i + 1, gp_Pnt(cx, cy + float(cs[i, 0]),
+                                        cz + float(cs[i, 1])))
+
+    interp = GeomAPI_Interpolate(harray, True, 1e-3)  # periodic=True
+    interp.Perform()
+    if not interp.IsDone():
+        raise RuntimeError("Cutting prism: BSpline interpolation failed")
+
+    curve = interp.Curve()
+    edge = BRepBuilderAPI_MakeEdge(curve).Edge()
+    wire = BRepBuilderAPI_MakeWire(edge).Wire()
+    face = BRepBuilderAPI_MakeFace(wire, True).Face()  # planar face
+
+    # Extrude along X-axis (chordwise) both directions
+    prism = BRepPrimAPI_MakePrism(face, gp_Vec(extrude_mm, 0, 0))
+    prism.Build()
+    if not prism.IsDone():
+        raise RuntimeError("Cutting prism: extrusion failed")
+
+    # Move prism so it's centered on cx (extrusion starts at face)
+    from OCP.gp import gp_Trsf
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    trsf = gp_Trsf()
+    trsf.SetTranslation(gp_Vec(-extrude_mm / 2, 0, 0))
+    return BRepBuilderAPI_Transform(prism.Shape(), trsf, True).Shape()
+
+
+def export_aircraft_step_v3(params: BWBParams, path: str,
+                             n_profile: int = 100,
+                             edf: 'EDFSpec | None' = None) -> dict:
+    """Export BWB aircraft with integrated propulsion as STEP compound.
+
+    Strategy:
+    1. Build OML solid via the exact v2 pipeline (periodic BSpline wires,
+       ThruSections C2 loft, mirror+fuse) -- proven quality.
+    2. Cut targeted openings in the OML using box cutting tools:
+       - Intake opening box (on upper surface)
+       - Exhaust slot box (at trailing edge)
+    3. Build the internal duct solid at its actual position.
+    4. Export as STEP compound: cut OML + duct channel.
+
+    Outputs 3 STEP files:
+    - {path}:                  compound (cut airframe + duct)
+    - {path}_oml_only.step:    OML without cuts (v2 quality reference)
+    - {path}_duct_only.step:   internal duct solid only
+    """
+    import os
+    import warnings
+    import cadquery as cq
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.Approx import Approx_ChordLength
+    from OCP.gp import gp_Pnt, gp_Trsf, gp_Ax2, gp_Dir
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.BRep import BRep_Builder
+
+    from ..propulsion.duct_geometry import (
+        compute_duct_placement, validate_duct_clearance,
+        build_sduct_geometry, build_edf_housing, build_exhaust_geometry,
+        build_exhaust_fairing, duct_cross_section,
+    )
+    from ..propulsion.edf_model import EDF_70MM
+
+    prop_edf = edf if edf is not None else EDF_70MM
+    p = params
+
+    # ==================================================================
+    # Step 1: OML solid -- exact v2 pipeline
+    # ==================================================================
+    print("[v3] 1/6  Building OML solid (v2 pipeline)...")
+
+    body_sections = _build_body_sections(p, n_profile)
+    wing_sections = _build_wing_sections(p, n_profile)
+    all_sections = body_sections + wing_sections[1:]
+
+    wires = [_make_periodic_wire(sec) for sec in all_sections]
+
+    loft = BRepOffsetAPI_ThruSections(True, False)
+    loft.SetMaxDegree(6)
+    loft.SetContinuity(GeomAbs_C2)
+    loft.SetParType(Approx_ChordLength)
+    loft.CheckCompatibility(True)
+    for w in wires:
+        loft.AddWire(w)
+    loft.Build()
+    if not loft.IsDone():
+        raise RuntimeError("OML loft failed")
+    right_solid = loft.Shape()
+
+    trsf = gp_Trsf()
+    trsf.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)))
+    left_solid = BRepBuilderAPI_Transform(right_solid, trsf, True).Shape()
+
+    fuse_op = BRepAlgoAPI_Fuse(right_solid, left_solid)
+    fuse_op.Build()
+    if fuse_op.IsDone():
+        oml_solid = fuse_op.Shape()
+    else:
+        warnings.warn("Mirror fuse failed -- using right half only")
+        oml_solid = right_solid
+
+    oml_path = path.replace('.step', '_oml_only.step')
+    cq.exporters.export(
+        cq.Workplane("XY").add(cq.Shape(oml_solid)),
+        oml_path, cq.exporters.ExportTypes.STEP,
+    )
+    oml_kb = os.path.getsize(oml_path) / 1024
+
+    vol_oml = GProp_GProps()
+    BRepGProp.VolumeProperties_s(oml_solid, vol_oml)
+    oml_volume = abs(vol_oml.Mass())
+    print("[v3]      OML OK  (%.0f KB, %.1f cm3)" % (oml_kb, oml_volume / 1e6))
+
+    # ==================================================================
+    # Step 2: Duct placement
+    # ==================================================================
+    print("[v3] 2/6  Computing duct placement...")
+    placement = compute_duct_placement(p, prop_edf)
+
+    # ==================================================================
+    # Step 3: Internal duct solid (at actual position, no extensions)
+    # ==================================================================
+    print("[v3] 3/6  Building internal duct solid...")
+    n_duct_profile = 48
+
+    import numpy as _np
+
+    sduct_secs = build_sduct_geometry(placement, p, prop_edf,
+                                       n_stations=12, n_profile=n_duct_profile)
+    housing_secs = build_edf_housing(placement, prop_edf,
+                                       n_profile=n_duct_profile, n_axial=4)
+    exhaust_secs = build_exhaust_geometry(placement, p, prop_edf,
+                                            n_stations=8, n_profile=n_duct_profile)
+
+    all_duct_secs = sduct_secs + housing_secs[1:] + exhaust_secs[1:]
+
+    duct_solid = None
+    duct_path = None
+    duct_kb = 0
+    try:
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+        from OCP.gp import gp_Vec
+
+        # 1. Main duct loft (no extensions)
+        main_duct = _loft_duct_solid(all_duct_secs)
+
+        # 2. Intake extension: extrude first section 60mm upstream (-X)
+        first_wire = _make_closed_wire(all_duct_secs[0] * 1000.0)
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+        first_face = BRepBuilderAPI_MakeFace(first_wire, True).Face()
+        intake_prism = BRepPrimAPI_MakePrism(
+            first_face, gp_Vec(-200.0, 0.0, 0.0)  # 200mm in -X (mm)
+        ).Shape()
+
+        # 3. Exhaust extension: extrude last section 100mm downstream (+X)
+        last_wire = _make_closed_wire(all_duct_secs[-1] * 1000.0)
+        last_face = BRepBuilderAPI_MakeFace(last_wire, True).Face()
+        exhaust_prism = BRepPrimAPI_MakePrism(
+            last_face, gp_Vec(100.0, 0.0, 0.0)  # 100mm in +X (mm)
+        ).Shape()
+
+        # 4. Fuse main + intake_ext + exhaust_ext
+        fuse1 = BRepAlgoAPI_Fuse(main_duct, intake_prism)
+        fuse1.Build()
+        fuse2 = BRepAlgoAPI_Fuse(fuse1.Shape(), exhaust_prism)
+        fuse2.Build()
+        duct_solid = fuse2.Shape()
+        duct_path = path.replace('.step', '_duct_only.step')
+        cq.exporters.export(
+            cq.Workplane("XY").add(cq.Shape(duct_solid)),
+            duct_path, cq.exporters.ExportTypes.STEP,
+        )
+        duct_kb = os.path.getsize(duct_path) / 1024
+        print("[v3]      Duct OK (%d sections, %.0f KB)" % (len(all_duct_secs), duct_kb))
+    except Exception as e:
+        warnings.warn("Duct loft failed: %s" % e)
+
+    # ==================================================================
+    # Step 4: Clearance validation
+    # ==================================================================
+    print("[v3] 4/6  Validating duct clearance...")
+    clr_ok, clr_results = validate_duct_clearance(placement, p)
+    if not clr_ok:
+        violations = [r for r in clr_results if not r.is_ok]
+        for v in violations[:5]:
+            warnings.warn(
+                "Clearance violation at x/c=%.3f: top=%.1fmm bot=%.1fmm"
+                % (v.x_frac, v.clearance_top_mm, v.clearance_bot_mm)
+            )
+    else:
+        min_top = min(r.clearance_top_mm for r in clr_results)
+        min_bot = min(r.clearance_bot_mm for r in clr_results)
+        print("[v3]      Clearance OK (min top=%.1fmm, min bot=%.1fmm)" % (min_top, min_bot))
+
+    # ==================================================================
+    # Step 5: Build duct shell (coque) = duct sections + skin
+    # ==================================================================
+    # The shell uses the EXACT same 3D sections as the duct solid,
+    # but each section is dilated outward from its centroid by skin_mm.
+    # This guarantees the shell perfectly wraps the duct.
+    print("[v3] 5/6  Building duct shell (coque)...")
+    shell_solid = None
+    skin_mm = 3.0
+
+    try:
+        import numpy as _np
+        shell_secs = []
+        for sec in all_duct_secs:
+            centroid = sec.mean(axis=0)
+            # Expand each point outward from centroid
+            directions = sec - centroid
+            norms = _np.linalg.norm(directions, axis=1, keepdims=True)
+            norms = _np.maximum(norms, 1e-9)
+            unit_dirs = directions / norms
+            expanded = sec + unit_dirs * (skin_mm / 1000.0)  # mm → m
+            shell_secs.append(expanded)
+
+        shell_solid = _loft_duct_solid(shell_secs)
+        vol_s = GProp_GProps()
+        BRepGProp.VolumeProperties_s(shell_solid, vol_s)
+        shell_kb = 0
+        shell_path = path.replace('.step', '_shell_only.step')
+        cq.exporters.export(
+            cq.Workplane("XY").add(cq.Shape(shell_solid)),
+            shell_path, cq.exporters.ExportTypes.STEP,
+        )
+        shell_kb = os.path.getsize(shell_path) / 1024
+        print("[v3]      Shell OK (vol=%.1f cm3, %.0f KB)" % (
+            abs(vol_s.Mass()) / 1e6, shell_kb))
+    except Exception as e:
+        warnings.warn("Shell build failed: %s" % e)
+
+    # ==================================================================
+    # Step 6: Boolean integration — Fuse(OML, Shell) then Cut(Duct)
+    # ==================================================================
+    # Use BOPAlgo_Builder with fuzzy tolerance for robust booleans.
+    print("[v3] 6/6  Boolean: Fuse(OML, Shell) + Cut(Duct)...")
+    result_solid = oml_solid
+    bool_ok = False
+
+    if shell_solid is not None and duct_solid is not None:
+        try:
+            from OCP.BOPAlgo import BOPAlgo_Builder
+
+            # Step 6a: Fuse OML + Shell
+            fuse_builder = BOPAlgo_Builder()
+            fuse_builder.AddArgument(oml_solid)
+            fuse_builder.AddArgument(shell_solid)
+            fuse_builder.SetFuzzyValue(0.05)  # 50 microns
+            fuse_builder.SetRunParallel(True)
+            fuse_builder.Perform()
+
+            if not fuse_builder.HasErrors():
+                fused = fuse_builder.Shape()
+                vol_f = GProp_GProps()
+                BRepGProp.VolumeProperties_s(fused, vol_f)
+                print("[v3]      Fuse OK (vol=%.1f cm3)" % (abs(vol_f.Mass()) / 1e6))
+
+                # Step 6b: Cut duct interior
+                cut_op = BRepAlgoAPI_Cut(fused, duct_solid)
+                cut_op.SetFuzzyValue(0.05)
+                cut_op.Build()
+                if cut_op.IsDone():
+                    result_solid = cut_op.Shape()
+                    vol_c = GProp_GProps()
+                    BRepGProp.VolumeProperties_s(result_solid, vol_c)
+                    bool_ok = True
+                    print("[v3]      Cut OK (vol=%.1f cm3)" % (abs(vol_c.Mass()) / 1e6))
+                else:
+                    warnings.warn("Cut failed — exporting multi-body fallback")
+            else:
+                warnings.warn("Fuse failed — exporting multi-body fallback")
+        except Exception as e:
+            warnings.warn("Boolean failed: %s — exporting multi-body fallback" % e)
+
+    # Fallback: multi-body compound if booleans failed
+    compound = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(compound)
+    if bool_ok:
+        builder.Add(compound, result_solid)
+    else:
+        builder.Add(compound, oml_solid)
+        if shell_solid is not None:
+            builder.Add(compound, shell_solid)
+        if duct_solid is not None:
+            builder.Add(compound, duct_solid)
+
+    analyzer = BRepCheck_Analyzer(compound)
+    is_valid = analyzer.IsValid()
+
+    vol_props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(compound, vol_props)
+    volume_mm3 = abs(vol_props.Mass())
+
+    area_props = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(compound, area_props)
+    surface_area_mm2 = area_props.Mass()
+
+    result_shape = cq.Workplane("XY").add(cq.Shape(compound))
+    cq.exporters.export(result_shape, path, cq.exporters.ExportTypes.STEP)
+    file_size_kb = os.path.getsize(path) / 1024
+
+    if bool_ok:
+        compound_mode = "integrated solid (fuse+cut)"
+    else:
+        compound_mode = "multi-body fallback: OML"
+        if shell_solid is not None:
+            compound_mode += " + shell"
+        if duct_solid is not None:
+            compound_mode += " + duct"
+
+    result = {
+        "path": path,
+        "file_size_kb": round(file_size_kb, 1),
+        "volume_mm3": round(volume_mm3, 1),
+        "surface_area_mm2": round(surface_area_mm2, 1),
+        "is_valid": is_valid,
+        "has_duct": duct_solid is not None,
+        "has_shell": shell_solid is not None,
+        "clearance_ok": clr_ok,
+        "compound_mode": compound_mode,
+        "oml_path": oml_path,
+        "oml_size_kb": round(oml_kb, 1),
+        "duct_path": duct_path,
+        "duct_size_kb": round(duct_kb, 1),
+        "n_oml_sections": len(all_sections),
+        "n_duct_sections": len(all_duct_secs),
+    }
+
+    print("[v3] Done: %.0f KB, valid=%s, boolean=%s, vol=%.1f cm3" % (
+        file_size_kb, is_valid, bool_ok, volume_mm3 / 1e6))
+
+    return result

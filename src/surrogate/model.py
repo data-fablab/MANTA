@@ -36,7 +36,7 @@ _TARGET_CLIP = {
     "CM_alpha":  (-15.0, 5.0),      # AVL P1/P99: -10.0 / 0.47
     "CD0_wing":  (0.001, 0.080),    # NeuralFoil-based, unchanged
     "CD0_body":  (0.0005, 0.050),   # Analytical, unchanged
-    "Cn_beta":   (-0.5, 2.0),       # AVL P1/P99: -0.04 / 0.99; tightened from (-5,5)
+    "Cn_beta":   (-0.018, 0.028),   # 3xIQR filter: removes 734 extreme outliers (1.2%), skew 3.6→1.2
     # v2 control derivatives
     "Cl_beta":   (-2.0, 0.5),       # Roll due to sideslip (negative = stable dihedral effect)
     "CLd01":     (-0.01, 0.30),     # CL per rad elevon deflection
@@ -98,13 +98,16 @@ class SurrogateModel:
     _training_history: list = field(default_factory=list, repr=False)
 
     def fit(self, X: np.ndarray, results: list[dict],
-            min_samples: int = 30) -> bool:
+            min_samples: int = 30, verbose: bool = True) -> bool:
         """Train ensemble on VLM evaluation results.
 
-        Extracts primitives (CL_0, CL_alpha, CM_0, CM_alpha, CD0_wing,
-        CD0_body, Cn_beta) from results, filters divergent samples, trains
+        Extracts primitives from results, filters divergent samples, trains
         uniformly on all data.
         """
+        def _log(msg: str) -> None:
+            if verbose:
+                print(msg, flush=True)
+
         if len(results) < min_samples:
             return False
 
@@ -151,27 +154,44 @@ class SurrogateModel:
 
         Y = np.array(Y_rows)
         X_valid = X[valid_indices] if isinstance(X, np.ndarray) else np.array(X)[valid_indices]
+        _log(f"  Extracted {len(Y)} valid samples from {len(results)} results")
 
         # --- Filter divergent samples using physical bounds ---
         mask = np.ones(len(Y), dtype=bool)
-        for j, key in enumerate(PRIMITIVE_TARGETS):
+        for j, key in enumerate(PRIMITIVE_TARGETS[:self._n_targets]):
             lo, hi = _TARGET_CLIP[key]
-            mask &= (Y[:, j] >= lo) & (Y[:, j] <= hi)
+            col_mask = (Y[:, j] >= lo) & (Y[:, j] <= hi)
+            n_rejected = (~col_mask).sum()
+            if n_rejected > 0:
+                _log(f"    {key}: clipped {n_rejected} samples outside [{lo}, {hi}]")
+            mask &= col_mask
 
         X_clean = X_valid[mask]
         Y_clean = Y[mask]
+        _log(f"  After clip filter: {len(X_clean)} samples ({len(Y) - len(X_clean)} rejected)")
 
         if len(X_clean) < min_samples:
             return False
 
         # --- Feature augmentation ---
         X_aug = augment_features(X_clean)
+        _log(f"  Features: {X_clean.shape[1]} raw -> {X_aug.shape[1]} augmented")
 
         # --- Scalers ---
         self._scaler_X.fit(X_aug)
         self._scaler_Y.fit(Y_clean)
         X_scaled = self._scaler_X.transform(X_aug)
         Y_scaled = self._scaler_Y.transform(Y_clean)
+
+        # --- Target stats after scaling ---
+        if verbose:
+            from scipy.stats import skew as _skew
+            _log(f"\n  {'Target':<12} {'Mean':>10} {'Std':>10} {'Skew':>8} {'Min':>10} {'Max':>10}")
+            _log(f"  {'-'*62}")
+            for j, key in enumerate(PRIMITIVE_TARGETS[:self._n_targets]):
+                col = Y_clean[:, j]
+                _log(f"  {key:<12} {col.mean():>10.5f} {col.std():>10.5f} {_skew(col):>8.2f} {col.min():>10.5f} {col.max():>10.5f}")
+            _log("")
 
         n_samples = len(X_scaled)
         n_features = X_scaled.shape[1]
@@ -196,6 +216,9 @@ class SurrogateModel:
 
         self._layers_used = layers
         batch_size = min(1024, max(256, n_samples // 32))
+        _log(f"  Architecture: MLP {'-'.join(str(l) for l in layers)}")
+        _log(f"  Training: {n_samples} samples, {n_features} features -> {n_targets} targets")
+        _log(f"  Hyperparams: epochs={epochs}, batch={batch_size}, wd={wd}, patience={patience}")
 
         self._models = []
         self._training_history = []
@@ -251,12 +274,15 @@ class SurrogateModel:
                     if wait >= patience:
                         break
 
+            stopped_epoch = epoch + 1
             if best_state is not None:
                 model.load_state_dict(best_state)
             model.eval()
             self._models.append(model)
+            _log(f"  Model {_i+1}/{self.n_ensemble}: best_val_loss={best_val:.6f}, stopped at epoch {stopped_epoch}/{epochs}")
 
         self._is_trained = True
+        _log(f"\n  Ensemble training complete ({self.n_ensemble} models)")
         return True
 
     def _predict_ensemble(self, X: np.ndarray) -> np.ndarray:

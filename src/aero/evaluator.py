@@ -286,7 +286,11 @@ class AeroEvaluator:
         }
 
         if cg_result:
-            result["cg_components"] = cg_result["components"]
+            # Store as JSON-serializable dicts (not dataclass objects)
+            result["cg_components"] = [
+                {"name": c.name, "mass": c.mass, "x_cg": c.x_cg}
+                for c in cg_result["components"]
+            ]
 
         return result
 

@@ -53,11 +53,21 @@ class ControlSurface:
     eta_outer: float
     sgn_dup: float
     gain: float = 1.0
+    segment_etas: list[float] | None = None  # dihedral breakpoints for multi-panel
 
     @property
     def xhinge(self) -> float:
         """Hinge x/c position (from LE). AVL convention."""
         return 1.0 - self.cf_ratio
+
+    @property
+    def panel_ranges(self) -> list[tuple[float, float]]:
+        """Return (eta_start, eta_end) for each physical panel."""
+        breakpoints = [self.eta_inner]
+        if self.segment_etas:
+            breakpoints.extend(self.segment_etas)
+        breakpoints.append(self.eta_outer)
+        return list(zip(breakpoints[:-1], breakpoints[1:]))
 
 
 @dataclass
@@ -79,6 +89,7 @@ class ControlConfig:
                 eta_inner=0.0,       # from body blend
                 eta_outer=0.50,      # to 50% outer span
                 sgn_dup=1.0,         # symmetric (both sides same → pitch)
+                segment_etas=[0.25], # split at dihedral break (15.9° → 8.5°)
             ),
             ControlSurface(
                 name="aileron",
@@ -86,6 +97,7 @@ class ControlConfig:
                 eta_inner=0.55,      # from 55% outer span
                 eta_outer=0.90,      # to 90% outer span
                 sgn_dup=-1.0,        # antisymmetric (sides opposite → roll)
+                # no segment_etas: dihedral ~constant across aileron
             ),
         ])
 

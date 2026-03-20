@@ -42,7 +42,12 @@ _DIHEDRAL_SEGMENTS = np.array([0.25, 0.25, 0.25, 0.15, 0.10])
 
 
 def augment_features(X: np.ndarray) -> np.ndarray:
-    """Append 22 derived geometric features to raw 30-var input -> (N, 52).
+    """Append 19 derived geometric features to raw 30-var input -> (N, 49).
+
+    Removed 3 features that were near-perfect duplicates (|r|>0.99):
+    - taper_elliptic_dev  ≡ |taper_ratio - 0.4|  (r=-1.0 with taper_ratio)
+    - total_twist         ≡ twist_tip             (r=+1.0 with twist_tip)
+    - blend_tc_mismatch   ≡ |body_tc - 0.105|     (r=+1.0 with body_tc_root)
 
     Parameters
     ----------
@@ -51,7 +56,7 @@ def augment_features(X: np.ndarray) -> np.ndarray:
 
     Returns
     -------
-    np.ndarray, shape (N, 52)
+    np.ndarray, shape (N, 49)
         Augmented feature matrix.
     """
     # --- Extract raw variables ---
@@ -88,8 +93,7 @@ def augment_features(X: np.ndarray) -> np.ndarray:
     # Mean aerodynamic chord (outer wing)
     mac = (2 / 3) * rc * (1 + tr + tr ** 2) / (1 + tr)
 
-    # Twist features
-    total_twist = twist_tip
+    # Twist features (total_twist removed: identical to twist_tip which is already in X)
     twist_gradient = twist_tip / np.maximum(outer_span, 1e-6)
     mean_twist = twists.mean(axis=1)
 
@@ -111,18 +115,13 @@ def augment_features(X: np.ndarray) -> np.ndarray:
     # Aerodynamic center offset (from wing root LE)
     ac_offset = 0.25 * mac + (outer_span / 3) * (1 + 2 * tr) / (1 + tr) * np.tan(sweep_rad)
 
-    # Taper deviation from elliptic optimum
-    taper_elliptic_dev = np.abs(tr - 0.4)
-
     # Body-derived features
+    # (taper_elliptic_dev removed: r=-1.0 with taper_ratio)
+    # (blend_tc_mismatch removed: r=+1.0 with body_tc_root)
     body_volume = body_root_chord * btc * bw * (np.pi / 4) * 0.6
     body_frontal_area = body_root_chord * btc
     body_wetted_area = 2.05 * (body_root_chord + rc) * bw
     body_aspect_ratio = 2 * bw / np.maximum((body_root_chord + rc) / 2, 1e-6)
-
-    # Blend mismatch: body t/c vs approximate wing root t/c
-    kulfan_root_tc_approx = 0.105
-    blend_tc_mismatch = np.abs(btc - kulfan_root_tc_approx)
 
     # Body total sweep
     body_sweep_total = sweep_deg + bsd
@@ -138,20 +137,17 @@ def augment_features(X: np.ndarray) -> np.ndarray:
         tip_chord,              # 33
         body_root_chord,        # 34
         outer_span,             # 35
-        total_twist,            # 36
-        twist_gradient,         # 37
-        mean_twist,             # 38
-        effective_span,         # 39
-        qc_sweep,               # 40
-        reflex_root,            # 41
-        camber_root,            # 42
-        ac_offset,              # 43
-        taper_elliptic_dev,     # 44
-        body_volume,            # 45
-        body_frontal_area,      # 46
-        body_wetted_area,       # 47
-        body_aspect_ratio,      # 48
-        blend_tc_mismatch,      # 49
-        body_sweep_total,       # 50
-        span_body_ratio,        # 51
+        twist_gradient,         # 36
+        mean_twist,             # 37
+        effective_span,         # 38
+        qc_sweep,               # 39
+        reflex_root,            # 40
+        camber_root,            # 41
+        ac_offset,              # 42
+        body_volume,            # 43
+        body_frontal_area,      # 44
+        body_wetted_area,       # 45
+        body_aspect_ratio,      # 46
+        body_sweep_total,       # 47
+        span_body_ratio,        # 48
     ])

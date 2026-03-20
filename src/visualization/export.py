@@ -192,64 +192,58 @@ def _build_body_sections(params: BWBParams, n_profile: int) -> list[np.ndarray]:
     return sections
 
 
-def _build_wing_sections(params: BWBParams, n_profile: int) -> list[np.ndarray]:
-    """Build 3D airfoil sections for the outer wing (6 stations).
+def _build_section_at_eta(params: BWBParams, eta: float, n_profile: int,
+                          le: np.ndarray, chord: float, twist_deg: float,
+                          flatten_aft: float | None = None) -> np.ndarray:
+    """Build a single 3D airfoil section at arbitrary eta.
 
-    Parameters
-    ----------
-    n_profile : int
-        Points per side (upper/lower). Each section will have 2*n_profile-1
-        points with cosine spacing (dense at LE and TE).
+    If flatten_aft is set (e.g. 0.75), the aft portion of the airfoil
+    is replaced with straight lines — creating a flat control surface zone.
     """
-    p = params
-    bw = p.body_halfwidth
-    outer_span = p.outer_half_span
-    tip_chord = p.tip_chord
-    body_sweep_rad = np.radians(p.body_sweep_deg)
-    wing_sweep_rad = np.radians(p.le_sweep_deg)
+    kaf = build_kulfan_airfoil_at_station(params, eta)
+    coords_2d = kaf.to_airfoil(n_coordinates_per_side=n_profile).coordinates
+    if flatten_aft is not None:
+        from ..parameterization.bwb_aircraft import flatten_airfoil_aft
+        coords_2d = flatten_airfoil_aft(coords_2d, x_hinge=flatten_aft)
+    x_local = coords_2d[:, 0] * chord
+    z_local = coords_2d[:, 1] * chord
+    twist_rad = np.radians(twist_deg)
+    x_rot = x_local * np.cos(twist_rad) + z_local * np.sin(twist_rad)
+    z_rot = -x_local * np.sin(twist_rad) + z_local * np.cos(twist_rad)
+    return np.column_stack([x_rot + le[0], np.full(len(x_rot), le[1]), z_rot + le[2]])
 
-    wing_chords = [p.wing_root_chord + frac * (tip_chord - p.wing_root_chord)
-                   for frac in OUTER_WING_STATIONS]
-    wing_twists = [0.0, p.twist_1, p.twist_2, p.twist_3, p.twist_4, p.twist_tip]
-    wing_dihedrals = [p.dihedral_0, p.dihedral_1, p.dihedral_2, p.dihedral_3, p.dihedral_tip]
 
-    # LE position at blend (must match body tip)
-    x_blend = bw * np.tan(body_sweep_rad)
+def _build_wing_sections(params: BWBParams, n_profile: int) -> list[np.ndarray]:
+    """Build wing sections with flat TE in control surface zones.
 
-    # Compute 3D positions from blend outward
-    positions = [[x_blend, bw, 0.0]]
-    for i in range(N_OUTER_SEGMENTS):
-        prev = positions[-1]
-        dy_seg = outer_span * (OUTER_WING_STATIONS[i + 1] - OUTER_WING_STATIONS[i])
-        dih_rad = np.radians(wing_dihedrals[i])
-        dx = dy_seg * np.tan(wing_sweep_rad)
-        dy = dy_seg * np.cos(dih_rad)
-        dz = dy_seg * np.sin(dih_rad)
-        positions.append([prev[0] + dx, prev[1] + dy, prev[2] + dz])
+    Control surface zones get flattened airfoils (linear TE aft of hinge).
+    Other zones keep full Kulfan profiles. No buffer stations needed —
+    the C2 loft handles the transition naturally.
+    """
+    from ..geometry.control_surfaces import classify_wing_segments, compute_wing_le_positions
+    from ..aero.avl_runner import ControlConfig
+
+    seg_groups = classify_wing_segments()
+    x_hinge = ControlConfig.default_bwb().surfaces[0].xhinge  # 0.75
+
+    def in_control_zone(eta):
+        for idx_s, idx_e, lt in seg_groups:
+            if lt == 'ruled':
+                lo = OUTER_WING_STATIONS[idx_s]
+                hi = OUTER_WING_STATIONS[idx_e]
+                if lo - 1e-6 <= eta <= hi + 1e-6:
+                    return True
+        return False
+
+    le_xyz, chords, twists = compute_wing_le_positions(params)
 
     sections = []
-    for i, frac in enumerate(OUTER_WING_STATIONS):
-        kaf = build_kulfan_airfoil_at_station(p, frac, name=f"wing_s{i}")
-        coords_2d = kaf.to_airfoil(n_coordinates_per_side=n_profile).coordinates
-
-        # Scale by chord
-        chord = wing_chords[i]
-        x_local = coords_2d[:, 0] * chord
-        z_local = coords_2d[:, 1] * chord
-
-        # Apply twist
-        twist_rad = np.radians(wing_twists[i])
-        x_rot = x_local * np.cos(twist_rad) + z_local * np.sin(twist_rad)
-        z_rot = -x_local * np.sin(twist_rad) + z_local * np.cos(twist_rad)
-
-        # Translate to 3D position
-        le = positions[i]
-        pts_3d = np.column_stack([
-            x_rot + le[0],
-            np.full(len(x_rot), le[1]),
-            z_rot + le[2],
-        ])
-        sections.append(pts_3d)
+    for i, eta in enumerate(OUTER_WING_STATIONS):
+        flatten = x_hinge if in_control_zone(eta) else None
+        sec = _build_section_at_eta(params, eta, n_profile,
+                                     le_xyz[i], chords[i], twists[i],
+                                     flatten_aft=flatten)
+        sections.append(sec)
 
     return sections
 
@@ -815,6 +809,35 @@ def export_aircraft_step(params: BWBParams, path: str,
 # STEP v2 export — watertight solid via BRepOffsetAPI_ThruSections loft
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _make_open_wire(pts_mm: np.ndarray, tol_mm: float = 1e-3):
+    """Convert an open polyline (n, 3) in mm to an OCC BSpline Wire.
+
+    Unlike _make_periodic_wire, this creates a non-periodic curve
+    (for hinge lines, control surface boundaries, etc.).
+    """
+    from OCP.TColgp import TColgp_HArray1OfPnt
+    from OCP.gp import gp_Pnt
+    from OCP.GeomAPI import GeomAPI_Interpolate
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
+
+    n = len(pts_mm)
+    harray = TColgp_HArray1OfPnt(1, n)
+    for i in range(n):
+        harray.SetValue(i + 1, gp_Pnt(float(pts_mm[i, 0]),
+                                        float(pts_mm[i, 1]),
+                                        float(pts_mm[i, 2])))
+
+    interp = GeomAPI_Interpolate(harray, False, tol_mm)  # periodic=False
+    interp.Perform()
+    if not interp.IsDone():
+        raise RuntimeError("GeomAPI_Interpolate failed for open BSpline wire")
+
+    curve = interp.Curve()
+    edge = BRepBuilderAPI_MakeEdge(curve).Edge()
+    wire = BRepBuilderAPI_MakeWire(edge).Wire()
+    return wire
+
+
 def _make_periodic_wire(pts_3d: np.ndarray, tol_mm: float = 1e-3):
     """Convert a closed (n_profile, 3) section in meters to an OCC periodic BSpline Wire.
 
@@ -896,7 +919,7 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
 
     p = params
 
-    # ── 2a. Build defining sections (8 total after merge at blend) ──
+    # ── 2a. Build defining sections ──
     body_sections = _build_body_sections(p, n_profile)
     wing_sections = _build_wing_sections(p, n_profile)
     all_sections = body_sections + wing_sections[1:]  # merge at blend
@@ -904,19 +927,14 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
     # ── 2b. Convert each section to a periodic BSpline wire ──
     wires = [_make_periodic_wire(sec) for sec in all_sections]
 
-    # ── 2c. Loft right half ──
-    # Note: SetSmoothing(True) is incompatible with periodic BSpline wires
-    # in OCCT — it fails silently. C2 continuity + chord-length parametrization
-    # already ensures smooth interpolation between sections.
+    # ── 2c. Single C2 loft (profiles have flat TE in control zones) ──
     loft = BRepOffsetAPI_ThruSections(True, False)  # isSolid=True, ruled=False
     loft.SetMaxDegree(6)
     loft.SetContinuity(GeomAbs_C2)
     loft.SetParType(Approx_ChordLength)
     loft.CheckCompatibility(True)
-
     for wire in wires:
         loft.AddWire(wire)
-
     loft.Build()
     if not loft.IsDone():
         raise RuntimeError("BRepOffsetAPI_ThruSections loft failed")
@@ -1194,6 +1212,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
 
     wires = [_make_periodic_wire(sec) for sec in all_sections]
 
+    # Single C2 loft (profiles have flat TE in control zones)
     loft = BRepOffsetAPI_ThruSections(True, False)
     loft.SetMaxDegree(6)
     loft.SetContinuity(GeomAbs_C2)
@@ -1388,6 +1407,31 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
         if duct_solid is not None:
             builder.Add(compound, duct_solid)
 
+    # ── Add control surface hinge wires to compound ──
+    n_hinge_wires = 0
+    try:
+        from ..geometry.control_surfaces import compute_control_surface_geometry
+        from ..aero.avl_runner import ControlConfig
+
+        geoms = compute_control_surface_geometry(p, ControlConfig.default_bwb(), n_spanwise=20)
+
+        for g in geoms:
+            # Build hinge line wire (upper surface) — right side
+            hinge_pts_mm = g.hinge_line_upper * 1000.0  # m → mm
+            if len(hinge_pts_mm) >= 2:
+                wire_r = _make_open_wire(hinge_pts_mm)
+                builder.Add(compound, wire_r)
+                # Mirror for left side (negate Y)
+                trsf_y = gp_Trsf()
+                trsf_y.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)))
+                wire_l = BRepBuilderAPI_Transform(wire_r, trsf_y, True).Shape()
+                builder.Add(compound, wire_l)
+                n_hinge_wires += 2
+        print("[v3]      Added %d hinge wires (%d control surfaces × 2 sides)" %
+              (n_hinge_wires, len(geoms)))
+    except Exception as e:
+        warnings.warn("Could not add hinge wires: %s" % e)
+
     analyzer = BRepCheck_Analyzer(compound)
     is_valid = analyzer.IsValid()
 
@@ -1399,8 +1443,14 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     BRepGProp.SurfaceProperties_s(compound, area_props)
     surface_area_mm2 = area_props.Mass()
 
-    result_shape = cq.Workplane("XY").add(cq.Shape(compound))
-    cq.exporters.export(result_shape, path, cq.exporters.ExportTypes.STEP)
+    # Use OCC STEP writer directly (CadQuery's exporter drops wires)
+    from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+    from OCP.Interface import Interface_Static
+
+    writer = STEPControl_Writer()
+    Interface_Static.SetCVal_s("write.step.schema", "AP214")
+    writer.Transfer(compound, STEPControl_AsIs)
+    writer.Write(path)
     file_size_kb = os.path.getsize(path) / 1024
 
     if bool_ok:
@@ -1411,6 +1461,63 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
             compound_mode += " + shell"
         if duct_solid is not None:
             compound_mode += " + duct"
+
+    # ── Export OML-conformant control surface faces as IGES ──
+    hinge_path = path.replace('.step', '_control_surfaces.iges').replace('.STEP', '_control_surfaces.iges')
+    hinge_kb = 0.0
+    if n_hinge_wires > 0:
+        from OCP.IGESControl import IGESControl_Writer
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+        from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
+        from OCP.TColgp import TColgp_Array2OfPnt
+        from OCP.GeomAbs import GeomAbs_C2
+        from ..geometry.control_surfaces import build_kulfan_chordwise_grids
+
+        n_chordwise = 8
+        grids = build_kulfan_chordwise_grids(
+            p, ControlConfig.default_bwb(),
+            n_spanwise=20, n_chordwise=n_chordwise)
+        print("[v3]      Built %d control surface grids (%d chordwise rows)" %
+              (len(grids), n_chordwise))
+
+        iges_writer = IGESControl_Writer("MM", 0)
+
+        for idx, g in enumerate(geoms):
+            n_span = len(g.eta_stations)
+
+            if grids is not None:
+                # Use Kulfan chordwise grid (meters → mm for STEP/IGES)
+                grid = grids[idx]  # (n_chordwise, n_span, 3) in meters
+                pts_grid = TColgp_Array2OfPnt(1, n_chordwise, 1, n_span)
+                for i in range(n_chordwise):
+                    for j in range(n_span):
+                        pts_grid.SetValue(i + 1, j + 1,
+                                          gp_Pnt(float(grid[i, j, 0] * 1000),
+                                                 float(grid[i, j, 1] * 1000),
+                                                 float(grid[i, j, 2] * 1000)))
+            else:
+                # Fallback: flat 2-row surface
+                pts_grid = TColgp_Array2OfPnt(1, 2, 1, n_span)
+                for j in range(n_span):
+                    h = g.hinge_line_upper[j] * 1000.0
+                    t = g.te_line_upper[j] * 1000.0
+                    pts_grid.SetValue(1, j + 1, gp_Pnt(float(h[0]), float(h[1]), float(h[2])))
+                    pts_grid.SetValue(2, j + 1, gp_Pnt(float(t[0]), float(t[1]), float(t[2])))
+
+            surf = GeomAPI_PointsToBSplineSurface(pts_grid, 3, 8, GeomAbs_C2, 0.1)
+            if surf.IsDone():
+                face = BRepBuilderAPI_MakeFace(surf.Surface(), 1e-3).Face()
+                iges_writer.AddShape(face)
+                # Mirror for left side
+                trsf_y = gp_Trsf()
+                trsf_y.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)))
+                face_l = BRepBuilderAPI_Transform(face, trsf_y, True).Shape()
+                iges_writer.AddShape(face_l)
+
+        iges_writer.ComputeModel()
+        iges_writer.Write(hinge_path)
+        hinge_kb = os.path.getsize(hinge_path) / 1024
+        print("[v3]      Control surfaces: %.0f KB -> %s" % (hinge_kb, hinge_path))
 
     result = {
         "path": path,
@@ -1426,11 +1533,14 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
         "oml_size_kb": round(oml_kb, 1),
         "duct_path": duct_path,
         "duct_size_kb": round(duct_kb, 1),
+        "hinge_path": hinge_path,
+        "hinge_size_kb": round(hinge_kb, 1),
         "n_oml_sections": len(all_sections),
         "n_duct_sections": len(all_duct_secs),
+        "n_hinge_wires": n_hinge_wires,
     }
 
-    print("[v3] Done: %.0f KB, valid=%s, boolean=%s, vol=%.1f cm3" % (
-        file_size_kb, is_valid, bool_ok, volume_mm3 / 1e6))
+    print("[v3] Done: %.0f KB, valid=%s, boolean=%s, vol=%.1f cm3, hinge_wires=%d" % (
+        file_size_kb, is_valid, bool_ok, volume_mm3 / 1e6, n_hinge_wires))
 
     return result

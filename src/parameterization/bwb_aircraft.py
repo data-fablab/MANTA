@@ -24,7 +24,15 @@ _TEMPLATE_LOWER = np.array([
 _FREE_INDICES = [2, 6, 7]  # optimizer-controlled Kulfan indices
 
 # Outer wing stations (fraction of outer half-span)
-OUTER_WING_STATIONS = [0.0, 0.25, 0.50, 0.75, 0.90, 1.0]
+# Aligned with dihedral breaks + control surface boundaries:
+#   0.00  elevon inboard start (blend)
+#   0.25  elevon split (dihedral break)
+#   0.50  elevon end
+#   0.55  aileron start
+#   0.75  mid-outboard
+#   0.90  aileron end
+#   1.00  tip
+OUTER_WING_STATIONS = [0.0, 0.25, 0.50, 0.55, 0.75, 0.90, 1.0]
 N_OUTER_SEGMENTS = len(OUTER_WING_STATIONS) - 1
 
 # Body stations (fraction of body half-width)
@@ -93,6 +101,51 @@ def build_kulfan_airfoil_at_station(
     l7 = p.kulfan_root_l7 + frac * (tip_l7 - p.kulfan_root_l7)
 
     return build_kulfan_airfoil(u2, u6, u7, l2, l6, l7, name=name)
+
+
+def flatten_airfoil_aft(coords_2d: np.ndarray, x_hinge: float = 0.75) -> np.ndarray:
+    """Replace the aft section of an airfoil with straight lines.
+
+    For x/c >= x_hinge, the upper and lower surfaces are replaced by
+    straight lines from the Kulfan point at x_hinge to the TE point.
+    This creates a flat control surface zone with a physical kink at
+    the hinge line.
+
+    Parameters
+    ----------
+    coords_2d : (N, 2) array in Selig format (TE_upper → LE → TE_lower).
+    x_hinge : float
+        Hinge x/c position (default 0.75 for 25% chord flap).
+
+    Returns
+    -------
+    (N, 2) array with linearized aft section. Forward of x_hinge is unchanged.
+    """
+    result = coords_2d.copy()
+    mid = np.argmin(result[:, 0])  # LE index
+
+    # Upper surface (Selig: indices 0..mid, TE→LE)
+    xs_upper = result[:mid + 1, 0]  # TE→LE direction (decreasing x)
+    te_z_upper = result[0, 1]       # TE upper z/c
+    # Interpolate hinge z from the original Kulfan curve
+    # Need LE→TE direction for np.interp (increasing x)
+    hinge_z_upper = np.interp(x_hinge, xs_upper[::-1], result[:mid + 1, 1][::-1])
+    for i in range(mid + 1):
+        xc = result[i, 0]
+        if xc >= x_hinge:
+            t = (xc - x_hinge) / (1.0 - x_hinge) if (1.0 - x_hinge) > 1e-10 else 1.0
+            result[i, 1] = hinge_z_upper + t * (te_z_upper - hinge_z_upper)
+
+    # Lower surface (Selig: indices mid..end, LE→TE)
+    te_z_lower = result[-1, 1]      # TE lower z/c
+    hinge_z_lower = np.interp(x_hinge, result[mid:, 0], result[mid:, 1])
+    for i in range(mid, len(result)):
+        xc = result[i, 0]
+        if xc >= x_hinge:
+            t = (xc - x_hinge) / (1.0 - x_hinge) if (1.0 - x_hinge) > 1e-10 else 1.0
+            result[i, 1] = hinge_z_lower + t * (te_z_lower - hinge_z_lower)
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -305,11 +358,14 @@ def _build_outer_wing(params: BWBParams) -> asb.Wing:
     # Chords at each station (linear taper)
     chords = [root_chord + frac * (tip_chord - root_chord) for frac in OUTER_WING_STATIONS]
 
-    # Twists
-    twists = [0.0, p.twist_1, p.twist_2, p.twist_3, p.twist_4, p.twist_tip]
+    # Twists at each station (7 stations)
+    # eta=0.55 twist is interpolated between twist_2 (eta=0.50) and twist_3 (eta=0.75)
+    twist_055 = p.twist_2 + (0.55 - 0.50) / (0.75 - 0.50) * (p.twist_3 - p.twist_2)
+    twists = [0.0, p.twist_1, p.twist_2, twist_055, p.twist_3, p.twist_4, p.twist_tip]
 
-    # Dihedrals per segment
-    dihedrals = [p.dihedral_0, p.dihedral_1, p.dihedral_2, p.dihedral_3, p.dihedral_tip]
+    # Dihedrals per segment (6 segments)
+    # Segment 0.50→0.55 inherits dihedral_2 (same dihedral region)
+    dihedrals = [p.dihedral_0, p.dihedral_1, p.dihedral_2, p.dihedral_2, p.dihedral_3, p.dihedral_tip]
 
     # Compute 3D positions from blend station outward
     wing_sweep_rad = np.radians(p.le_sweep_deg)

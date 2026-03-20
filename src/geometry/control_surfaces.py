@@ -182,11 +182,13 @@ def compute_control_surface_geometry(
             twist_rad = np.radians(twists[i])
             le = le_xyz[i]
 
-            # Generate Kulfan airfoil at this station
+            # Generate Kulfan airfoil at this station (flattened aft of hinge)
+            from ..parameterization.bwb_aircraft import flatten_airfoil_aft
             kaf = build_kulfan_airfoil_at_station(params, eta)
             coords_2d = kaf.to_airfoil(n_coordinates_per_side=n_profile).coordinates
+            coords_2d = flatten_airfoil_aft(coords_2d, x_hinge=xhinge)
 
-            # Find hinge and TE points on upper and lower surfaces
+            # Find hinge and TE points on flattened surfaces
             hinge_up_2d = _find_surface_point(coords_2d, xhinge, "upper")
             hinge_lo_2d = _find_surface_point(coords_2d, xhinge, "lower")
             te_up_2d = _find_surface_point(coords_2d, 1.0, "upper")

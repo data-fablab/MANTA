@@ -217,8 +217,8 @@ def _build_wing_sections(params: BWBParams, n_profile: int) -> list[np.ndarray]:
     """Build wing sections with flat TE in control surface zones.
 
     Control surface zones get flattened airfoils (linear TE aft of hinge).
-    Other zones keep full Kulfan profiles. No buffer stations needed —
-    the C2 loft handles the transition naturally.
+    Other zones keep full Kulfan profiles. Uses only the 7 defining stations
+    — no intermediate sections (they destabilize the C2 loft).
     """
     from ..geometry.control_surfaces import classify_wing_segments, compute_wing_le_positions
     from ..aero.avl_runner import ControlConfig
@@ -1471,38 +1471,20 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
         from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
         from OCP.TColgp import TColgp_Array2OfPnt
         from OCP.GeomAbs import GeomAbs_C2
-        from ..geometry.control_surfaces import build_kulfan_chordwise_grids
-
-        n_chordwise = 8
-        grids = build_kulfan_chordwise_grids(
-            p, ControlConfig.default_bwb(),
-            n_spanwise=20, n_chordwise=n_chordwise)
-        print("[v3]      Built %d control surface grids (%d chordwise rows)" %
-              (len(grids), n_chordwise))
-
         iges_writer = IGESControl_Writer("MM", 0)
 
         for idx, g in enumerate(geoms):
             n_span = len(g.eta_stations)
 
-            if grids is not None:
-                # Use Kulfan chordwise grid (meters → mm for STEP/IGES)
-                grid = grids[idx]  # (n_chordwise, n_span, 3) in meters
-                pts_grid = TColgp_Array2OfPnt(1, n_chordwise, 1, n_span)
-                for i in range(n_chordwise):
-                    for j in range(n_span):
-                        pts_grid.SetValue(i + 1, j + 1,
-                                          gp_Pnt(float(grid[i, j, 0] * 1000),
-                                                 float(grid[i, j, 1] * 1000),
-                                                 float(grid[i, j, 2] * 1000)))
-            else:
-                # Fallback: flat 2-row surface
-                pts_grid = TColgp_Array2OfPnt(1, 2, 1, n_span)
-                for j in range(n_span):
-                    h = g.hinge_line_upper[j] * 1000.0
-                    t = g.te_line_upper[j] * 1000.0
-                    pts_grid.SetValue(1, j + 1, gp_Pnt(float(h[0]), float(h[1]), float(h[2])))
-                    pts_grid.SetValue(2, j + 1, gp_Pnt(float(t[0]), float(t[1]), float(t[2])))
+            # Simple 2-row ruled surface (hinge → TE) per panel.
+            # Since the OML profiles are flattened in control zones,
+            # these ruled faces match the OML quasi-perfectly.
+            pts_grid = TColgp_Array2OfPnt(1, 2, 1, n_span)
+            for j in range(n_span):
+                h = g.hinge_line_upper[j] * 1000.0
+                t = g.te_line_upper[j] * 1000.0
+                pts_grid.SetValue(1, j + 1, gp_Pnt(float(h[0]), float(h[1]), float(h[2])))
+                pts_grid.SetValue(2, j + 1, gp_Pnt(float(t[0]), float(t[1]), float(t[2])))
 
             surf = GeomAPI_PointsToBSplineSurface(pts_grid, 3, 8, GeomAbs_C2, 0.1)
             if surf.IsDone():

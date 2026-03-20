@@ -1,0 +1,92 @@
+# nEUROn v2 — Default aircraft configuration
+# All parameters used across the MDO pipeline.
+
+mission:
+  velocity_ms: 20.0
+  altitude_m: 100.0
+  mtow_kg: 1.5
+  avionics_mass_kg: 0.10
+  edf: EDF_70MM
+  battery: BATTERY_3S_1800
+
+feasibility:
+  # Static margin [fraction MAC]
+  sm_min: 0.05
+  sm_max: 0.25
+  # Trim
+  cm_max: 0.20
+  cl_max: 0.75
+  cl_min: 0.05
+  ar_min: 4.5
+  volume_min: 0.002        # [m3]
+  cn_beta_min: 0.005
+  # Propulsion
+  td_min: 1.2
+  endurance_min: 480.0     # [s]
+  drag_margin: 1.25
+  # Stall / control
+  vs_max: 12.0             # [m/s]
+  cl_max_clean: 0.85
+  alpha_trim_max: 10.0     # [deg]
+  elevon_deflection_max: 15.0  # [deg]
+  cl_beta_cn_beta_max: -30.0
+  # Manufacturability
+  manufacturability_min: 0.40
+  # Penalty weights
+  weights:
+    w_sm_lo: 20.0
+    w_sm_hi: 25.0
+    w_trim: 15.0
+    w_mass: 10.0
+    w_cl: 10.0
+    w_ar: 5.0
+    w_volume: 15.0
+    w_cn_beta: 15.0
+    w_td: 20.0
+    w_endurance: 15.0
+    w_duct_fit: 25.0
+    w_vs: 20.0
+    w_alpha_trim: 10.0
+    w_elevon_defl: 15.0
+    w_dutch_roll: 10.0
+    w_manufacturability: 10.0
+
+cg:
+  battery_xc: 0.22
+  edf_xc: 0.40
+  avionics_xc: 0.28
+  servo_mass_kg: 0.040
+  servo_xc: 0.70
+
+controls:
+  elevon:
+    cf_ratio: 0.25
+    eta_inner: 0.0
+    eta_outer: 0.50
+    sgn_dup: 1.0           # symmetric (pitch)
+  aileron:
+    cf_ratio: 0.25
+    eta_inner: 0.55
+    eta_outer: 0.90
+    sgn_dup: -1.0           # antisymmetric (roll)
+
+avl:
+  command: "d:/UAV/tools/avl/avl.exe"
+  chordwise_res: 6
+  spanwise_res: 8
+  timeout: 10.0
+
+surrogate:
+  path: "models/surrogate_v2_ctrl"
+  n_ensemble: 5
+  n_targets: 10
+
+optimization:
+  method: surrogate
+  n_restarts: 3
+  n_infill: 40
+  max_cycles: 6
+  de_maxiter: 200
+  de_popsize: 50
+  convergence_tol: 0.02
+  seed: 42

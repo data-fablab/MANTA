@@ -11,6 +11,7 @@ from ..parameterization.design_variables import BWBParams, params_from_vector
 from ..aero.mission import MissionCondition, FeasibilityConfig, DEFAULT_FEASIBILITY
 from ..aero.drag import oswald_efficiency
 from ..parameterization.bwb_aircraft import (
+    build_airplane,
     compute_wing_area,
     compute_mac,
     compute_aspect_ratio,
@@ -18,6 +19,8 @@ from ..parameterization.bwb_aircraft import (
     compute_internal_volume,
 )
 from ..propulsion.edf_model import thrust_at_speed, duct_fits_in_body, intake_drag
+from ..systems.cg import compute_cg, CGConfig, DEFAULT_CG_CONFIG
+from ..evaluation.manufacturability import compute_manufacturability
 
 # Design-vector indices (match design_variables.py)
 _IDX_HALF_SPAN = 0
@@ -34,6 +37,7 @@ def reconstruct_aero(
     x: np.ndarray,
     mission: MissionCondition | None = None,
     feasibility: FeasibilityConfig | None = None,
+    cg_config: CGConfig | None = None,
 ) -> dict:
     """Reconstruct all derived aerodynamic and propulsion quantities from
     7 VLM primitives.
@@ -123,7 +127,51 @@ def reconstruct_aero(
 
     cl = cl_0 + cl_alpha * alpha_eq_rad
     cm = cm_0 + cm_alpha * alpha_eq_rad
-    sm = np.where(np.abs(cl_alpha) > 0.01, -cm_alpha / cl_alpha, 0.0)
+    sm_raw = np.where(np.abs(cl_alpha) > 0.01, -cm_alpha / cl_alpha, 0.0)
+
+    # ── CG correction ──
+    # The surrogate was trained with x_ref = 0.30 * body_root_chord.
+    # Real CG is different. The correction uses c_ref (AeroSandbox reference chord),
+    # NOT MAC, because AVL normalizes moments by c_ref.
+    # c_ref ≈ mean chord of the full aircraft (body + wing), approximated as:
+    #   c_ref = S_ref / (2 * half_span) = wing_area / span
+    cg_config = cg_config or DEFAULT_CG_CONFIG
+    x_cg_old = body_root_chord * 0.30  # training reference
+    c_ref = s_ref / (2.0 * hs)  # AeroSandbox convention: area / span
+    sm = sm_raw.copy()
+    x_cg_real = np.zeros(n)
+    manuf_score = np.zeros(n)
+    for i in range(n):
+        params_i = params_from_vector(x[i])
+        cg_result = compute_cg(
+            params_i,
+            battery_mass=mission.battery.mass,
+            edf_mass=mission.edf.mass,
+            avionics_mass=mission.avionics_mass,
+            config=cg_config,
+        )
+        x_cg_real[i] = cg_result["x_cg"]
+        # Manufacturability (geometry-only, no AVL)
+        manuf_score[i] = compute_manufacturability(params_i)["manufacturability_score"]
+        # Correct SM for real CG: SM_real = SM_raw + (x_cg_old - x_cg_real) / c_ref
+        if c_ref[i] > 0.01:
+            sm[i] = sm_raw[i] + (x_cg_old[i] - x_cg_real[i]) / c_ref[i]
+            # Correct CM at trim for real CG
+            cm[i] = cm[i] + cl[i] * (x_cg_real[i] - x_cg_old[i]) / c_ref[i]
+
+    # Elevon trim deflection from CM at trim
+    # delta_e [deg] ≈ -CM_trim / Cm_de  where Cm_de is [1/deg]
+    # Use predicted Cm_de if available (v2 surrogate), otherwise estimate
+    cmd01 = np.atleast_1d(np.asarray(primitives.get("Cmd01", 0.0), dtype=float))
+    cl_beta_pred = np.atleast_1d(np.asarray(primitives.get("Cl_beta", 0.0), dtype=float))
+    # Cmd01 is per radian from AVL; convert to per degree
+    cm_de_per_deg = np.where(np.abs(cmd01) > 1e-6, cmd01 / np.degrees(1.0), -0.01)
+    elevon_defl = np.where(
+        np.abs(cm) > 0.001,
+        -cm / cm_de_per_deg,  # [deg]
+        0.0,
+    )
+    elevon_defl = np.clip(elevon_defl, -25.0, 25.0)
 
     # Stall speed
     vs = np.sqrt(2 * weight / (mission.density * s_ref * feasibility.cl_max_clean))
@@ -135,7 +183,14 @@ def reconstruct_aero(
     cd0 = cd0_wing + cd0_body + cd_intake
 
     cdi = np.where(ar > 1.0, cl ** 2 / (np.pi * ar * e_oswald), 0.1)
-    cd = cd0 + cdi
+
+    # Trim drag estimate from elevon deflection
+    cd_trim = np.where(
+        np.abs(elevon_defl) > 0.1,
+        0.0001 * np.abs(elevon_defl) / 10.0,  # profile drag increment
+        0.0,
+    )
+    cd = cd0 + cdi + cd_trim
     ld = np.where(cd > 1e-4, cl / cd, 0.0)
     cd_effective = cd * feasibility.drag_margin
 
@@ -178,6 +233,9 @@ def reconstruct_aero(
             duct_fits=bool(duct_fits_arr[i]),
             vs=float(vs[i]),
             alpha_trim=float(alpha_eq[i]),
+            elevon_deflection=float(elevon_defl[i]),
+            cl_beta=float(cl_beta_pred[i]) if len(cl_beta_pred) > 1 else float(cl_beta_pred[0]),
+            manufacturability_score=float(manuf_score[i]),
         )
         penalty[i] = p_val
         is_feasible[i] = feasibility.is_feasible(
@@ -194,6 +252,9 @@ def reconstruct_aero(
             duct_fits=bool(duct_fits_arr[i]),
             vs=float(vs[i]),
             alpha_trim=float(alpha_eq[i]),
+            elevon_deflection=float(elevon_defl[i]),
+            cl_beta=float(cl_beta_pred[i]) if len(cl_beta_pred) > 1 else float(cl_beta_pred[0]),
+            manufacturability_score=float(manuf_score[i]),
         )
 
     result = {
@@ -209,6 +270,7 @@ def reconstruct_aero(
         "CD0_wing": cd0_wing,
         "CD0_body": cd0_body,
         "CD_intake": cd_intake,
+        "CD_trim": cd_trim,
         "CD_effective": cd_effective,
         "Cn_beta": cn_beta,
         "oswald_e": e_oswald,
@@ -219,6 +281,10 @@ def reconstruct_aero(
         "internal_volume": internal_volume,
         "Vs": vs,
         "CL_required": cl_required,
+        "manufacturability_score": manuf_score,
+        "Cl_beta": cl_beta_pred,
+        "Cmd01": cmd01,
+        "elevon_deflection": elevon_defl,
         # Propulsion
         "T_available": t_available,
         "T_over_D": t_over_d,

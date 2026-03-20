@@ -1,33 +1,33 @@
 # nEUROn v2 — BWB Flying Wing Optimizer
 
 Multi-disciplinary design optimization framework for a Blended Wing Body (BWB) flying wing UAV.
-Combines parametric geometry, aerodynamic analysis (VLM), surrogate modeling (PyTorch), CAD export,
-and multi-criteria design exploration to produce optimized aircraft designs ready for manufacturing.
+Combines parametric geometry, aerodynamic analysis (VLM + control surfaces), real CG computation,
+surrogate modeling (PyTorch, 10 targets), CAD export, and multi-criteria design exploration.
 
 ## Pipeline
 
 ```
-01_mission_and_propulsion   Mission specs, EDF motor selection
+01_mission_and_propulsion   Mission specs, EDF motor selection, constraints
         |
 02_parametric_geometry      30-variable BWB parametric model
         |
 03_dataset_generation       60k Latin Hypercube samples, AVL evaluation
         |
-03bis_data_preparation      Data cleaning, feature engineering
+04_data_preparation         Data cleaning, feature engineering
         |
-04_surrogate_training       5-output PyTorch ensemble surrogate
+05_surrogate_training       10-target PyTorch ensemble surrogate
         |
-04bis_cn_beta_study         Directional stability parameter study
+05bis_cn_beta_study         Directional stability parameter study (optional)
         |
-05_optimization             Design optimization via surrogate
+06_optimization             Surrogate-assisted DE + NSGA-II multi-objective
         |
-06_validation               Re-evaluation with full VLM (AVL)
+07_validation               Full AVL re-evaluation, geometry viz, CG, controls
         |
-07_export_cad               STL, STEP, profiles + splines export
+08_export_cad               STL, STEP v2/v3, profiles + splines
         |
-08_propulsion_integration   EDF duct placement, clearance, STEP booleans
+09_propulsion_integration   EDF duct placement, clearance, STEP booleans
         |
-09_design_catalog           Multi-design trade-off analysis & batch export
+10_design_catalog           Multi-design trade-off analysis & batch export
 ```
 
 ## Project Structure
@@ -36,14 +36,18 @@ and multi-criteria design exploration to produce optimized aircraft designs read
 nEUROn_v2/
   src/
     parameterization/       30-variable BWB geometry (design_variables.py, bwb_aircraft.py)
-    aero/                   Aerodynamic evaluation (AVL runner, drag model, mission)
+    aero/                   AVL runner (with elevon/aileron controls), drag, mission, dynamics
     propulsion/             EDF motor model, duct geometry, duct aerodynamics
-    surrogate/              PyTorch ensemble surrogate (model, features, reconstruct)
-    optimization/           Problem formulation, candidates, database, design catalog
+    surrogate/              PyTorch ensemble surrogate (10 targets), reconstruct with CG correction
+    optimization/           DE, NSGA-II, candidates, database, design catalog
     evaluation/             Manufacturability scoring (geometric complexity metrics)
-    visualization/          CAD export (STL, STEP), robust booleans, comparison plots
-  notebooks/                Jupyter notebooks (pipeline steps 01-09)
-  scripts/                  Standalone AVL utilities
+    visualization/          CAD export (STL, STEP v1-v3), robust booleans, comparison plots
+    systems/                CG computation, mass budget
+    config.py               YAML configuration loader
+  config/
+    default.yaml            All pipeline parameters (mission, feasibility, CG, controls, AVL)
+  notebooks/                Jupyter notebooks (pipeline steps 01-10)
+  scripts/                  AVL regeneration, training + optimization
   requirements.txt          Python dependencies
 ```
 
@@ -56,11 +60,11 @@ pip install -r requirements.txt
 pip install cadquery             # for STEP export
 ```
 
-AVL (Athena Vortex Lattice) must be available for aerodynamic evaluation.
+AVL and XFOIL must be available for aerodynamic evaluation and profile validation.
 
 ## Design Variables
 
-30 continuous variables organized in 4 groups:
+30 continuous variables organized in 5 groups:
 
 | Group | Variables | Count |
 |-------|-----------|:-----:|
@@ -70,89 +74,87 @@ AVL (Athena Vortex Lattice) must be available for aerodynamic evaluation.
 | **Outer wing dihedral** | dihedral_0 .. dihedral_tip | 5 |
 | **Kulfan CST airfoil** | kulfan_root_{u2,u6,u7,l2,l6,l7}, kulfan_tip_delta_{tc,camber} | 8 |
 
-## CAD Export
+## Surrogate Model (10 targets)
 
-Four export modes in `src/visualization/export.py`:
+The ensemble MLP predicts 10 VLM primitives from the 30 design variables:
+
+| Target | Description | R2 |
+|--------|-------------|-----|
+| CL_0, CL_alpha | Lift at alpha=0, lift curve slope | >0.99 |
+| CM_0, CM_alpha | Pitching moment, longitudinal stability | >0.99 |
+| CD0_wing, CD0_body | Parasite drag (NeuralFoil + analytical) | >0.99 |
+| Cn_beta | Directional stability | 0.91 |
+| **Cl_beta** | Roll due to sideslip (Dutch roll coupling) | **0.996** |
+| **CLd01** | Elevon lift effectiveness | **0.999** |
+| **Cmd01** | Elevon pitch moment effectiveness | **0.999** |
+
+All derived quantities (L/D, static margin, trim, propulsion, CG, feasibility) are
+reconstructed analytically in `src/surrogate/reconstruct.py`.
+
+## Control Surfaces
+
+Elevon + aileron layout defined in `src/aero/avl_runner.py`:
+- **Elevon** (pitch): 25% chord, 0-50% outer wing span, symmetric deflection
+- **Aileron** (roll): 25% chord, 55-90% outer wing span, antisymmetric deflection
+- AVL trim: automatic elevon deflection to achieve CM=0
+
+## CG Computation
+
+Real center of gravity from component placement (`src/systems/cg.py`):
+- Body structure, wing structure (shell + spar)
+- Battery, EDF motor, avionics, servos
+- Configurable positions via `config/default.yaml`
+- SM correction: SM_real = SM_raw + (x_cg_old - x_cg_real) / c_ref
+
+## CAD Export
 
 | Format | Function | Description |
 |--------|----------|-------------|
-| **STL** | `export_aircraft_stl()` | Triangulated mesh for visualization / 3D printing |
-| **STEP v1** | `export_aircraft_step()` | Single BSpline surface (approximation) |
+| **STL** | `export_aircraft_stl()` | Triangulated mesh |
 | **STEP v2** | `export_aircraft_step_v2()` | Watertight solid via ThruSections loft |
 | **STEP v3** | `export_aircraft_step_v3()` | OML + propulsion duct with boolean integration |
 
-STEP v2/v3 features:
-- Exact interpolation through section wires (zero deviation)
-- Periodic BSpline wires with native cosine spacing (0.05 mm fidelity)
-- C2 continuity, chord-length parametrization
-- Robust STEP booleans via `step_booleans.py`: ShapeFix healing +
-  BOPAlgo_CellsBuilder with cascading fallbacks (preserves full NURBS quality)
-- Validation: topology check, volume, surface area, max deviation
+Robust STEP booleans via ShapeFix + BOPAlgo_CellsBuilder with cascading fallbacks.
 
-## Design Catalog
-
-The design catalog (`src/optimization/catalog.py`) enables multi-criteria design exploration:
-
-- **Named designs**: baseline (defaults), optimized (best_x.npy), Pareto-optimal, custom
-- **α-blending**: interpolate between any two designs in the 30D space
-- **Manufacturability scoring** (`src/evaluation/manufacturability.py`): composite score [0-1]
-  based on twist/dihedral gradients, minimum thickness, taper severity, mold complexity
-- **Comparison plots** (`src/visualization/comparison.py`): Pareto plot, radar chart,
-  planform overlay, summary table
-- **Batch STEP export**: export all catalog designs for downstream FEA/manufacturing pipeline
-
-```python
-from src.optimization.catalog import DesignCatalog
-
-catalog = DesignCatalog()
-catalog.add_baseline()
-catalog.add_optimized('output/best_x.npy')
-catalog.interpolate('baseline', 'optimized', [0.2, 0.4, 0.6, 0.8])
-catalog.evaluate_aero(use_surrogate=True)
-catalog.evaluate_manufacturability()
-catalog.export_all_step('output/catalog/')
-catalog.save('output/catalog.json')
-```
-
-## Optimized Design
+## Optimized Design (v2)
 
 ```
 Geometry:
-  Span              2.00 m
-  Wing area          4976 cm2
-  Aspect ratio       8.02
-  Body chord          700 mm
-  Taper ratio        0.28
+  Span              1.35 m
+  Wing area          2975 cm2
+  Aspect ratio       6.1
 
 Aerodynamics:
-  L/D               22.87
-  CL                 0.414
-  CD                 0.0181
-  Static margin      9.0% MAC
+  L/D               11.57
+  CL                 0.175
+  CD                 0.0151
+
+Stability & Control:
+  Static margin      9.7% MAC (real CG)
+  Elevon deflection  9.8 deg
+  Cn_beta            0.018
 
 Structure:
-  Structural mass     825 g
-  Internal volume    2051 cm3
+  Structural mass     508 g
+  Internal volume    1200 cm3
 
 Propulsion (EDF 70mm):
-  T/D                1.57
-  Endurance          8.0 min
-  Range              9.6 km
+  T/D                3.14
+  Endurance          16.0 min
+  Range              19.2 km
 ```
 
 ## Usage
 
-Run notebooks in order (01 through 09). Each notebook documents its inputs, outputs,
-and intermediate results. Notebook `07_export_cad` produces manufacturing-ready
-CAD files, `08_propulsion_integration` adds the EDF duct, and `09_design_catalog`
-enables multi-criteria trade-off analysis between designs.
+Run notebooks in order (01 through 10). Configuration via `config/default.yaml`.
 
 ```python
-from src.visualization.export import export_aircraft_step_v2
-from src.parameterization.design_variables import BWBParams, params_from_vector
-import numpy as np
+from src.config import load_all
 
-best_x = np.load('output/best_x.npy')
-params = params_from_vector(best_x)
-metrics = export_aircraft_step_v2(params, 'output/cad_export/neuron_v2_solid.step')
+cfg = load_all('config/default.yaml')
+mission = cfg['mission']
+feasibility = cfg['feasibility']
+
+from src.optimization.problem import run_optimization
+result = run_optimization(mission=mission, feasibility=feasibility, method='surrogate')
 ```

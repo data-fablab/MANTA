@@ -217,7 +217,7 @@ def _surrogate_objective_vectorized(
 def run_surrogate_assisted(
     mission: MissionCondition | None = None,
     feasibility: FeasibilityConfig | None = None,
-    surrogate_path: str = "models/surrogate_v2",
+    surrogate_path: str = "models/surrogate_v2_ctrl",
     n_restarts: int = 3,
     n_infill: int = 40,
     max_cycles: int = 5,
@@ -419,6 +419,118 @@ def run_surrogate_assisted(
     }
 
 
+# ---------------------------------------------------------------------------
+# Multi-objective: NSGA-II via pymoo
+# ---------------------------------------------------------------------------
+
+def run_nsga2(
+    mission: MissionCondition | None = None,
+    feasibility: FeasibilityConfig | None = None,
+    surrogate_path: str = "models/surrogate_v2_ctrl",
+    n_gen: int = 200,
+    pop_size: int = 100,
+    seed: int = 42,
+    verbose: bool = True,
+) -> dict:
+    """Multi-objective optimization using NSGA-II on surrogate.
+
+    Objectives: minimize [-L/D, struct_mass] (bi-objective)
+    Constraints: all FeasibilityConfig constraints (penalty <= 0)
+
+    Returns dict with 'pareto_X', 'pareto_F', 'pareto_results', 'pymoo_result'.
+    """
+    from pymoo.core.problem import ElementwiseProblem
+    from pymoo.algorithms.moo.nsga2 import NSGA2
+    from pymoo.operators.crossover.sbx import SBX
+    from pymoo.operators.mutation.pm import PM
+    from pymoo.operators.sampling.rnd import FloatRandomSampling
+    from pymoo.optimize import minimize as pymoo_minimize
+
+    mission = mission or MissionCondition()
+    feasibility = feasibility or DEFAULT_FEASIBILITY
+    surrogate = SurrogateModel.load(surrogate_path)
+    lb, ub = get_bounds_arrays()
+
+    if verbose:
+        print(f"=== NSGA-II Multi-Objective Optimization ===")
+        print(f"Objectives: minimize [-L/D, struct_mass]")
+        print(f"Constraints: penalty <= 0 (all feasibility constraints)")
+        print(f"Population: {pop_size}, Generations: {n_gen}")
+
+    class BWBProblem(ElementwiseProblem):
+        def __init__(self):
+            super().__init__(
+                n_var=N_VARS,
+                n_obj=2,
+                n_ieq_constr=1,
+                xl=lb,
+                xu=ub,
+            )
+
+        def _evaluate(self, x, out, *args, **kwargs):
+            prim = surrogate.predict(x)
+            r = reconstruct_aero(prim, x, mission, feasibility)
+
+            # Objectives: minimize both
+            out["F"] = [-r["L_over_D"], r["struct_mass"]]
+            # Constraint: penalty <= 0 means feasible
+            out["G"] = [r["penalty"] - 0.01]  # small tolerance
+
+    problem = BWBProblem()
+
+    algorithm = NSGA2(
+        pop_size=pop_size,
+        sampling=FloatRandomSampling(),
+        crossover=SBX(prob=0.9, eta=15),
+        mutation=PM(eta=20),
+        eliminate_duplicates=True,
+    )
+
+    res = pymoo_minimize(
+        problem, algorithm,
+        termination=("n_gen", n_gen),
+        seed=seed,
+        verbose=verbose,
+    )
+
+    # Extract Pareto front
+    pareto_X = res.X  # (n_pareto, 30)
+    pareto_F = res.F  # (n_pareto, 2) = [-L/D, mass]
+
+    # Reconstruct full results for Pareto designs
+    pareto_results = []
+    if pareto_X is not None:
+        for x in pareto_X:
+            prim = surrogate.predict(x)
+            r = reconstruct_aero(prim, x, mission, feasibility)
+            # Convert arrays to scalars
+            r_scalar = {k: (float(v) if hasattr(v, '__len__') and len(v) > 0 else float(v))
+                        for k, v in r.items()
+                        if not isinstance(v, (bool, np.bool_))}
+            r_scalar["is_feasible"] = bool(r.get("is_feasible", False))
+            r_scalar["duct_fits"] = bool(r.get("duct_fits", False))
+            pareto_results.append(r_scalar)
+
+    n_feasible = sum(1 for r in pareto_results if r.get("is_feasible", False))
+
+    if verbose and pareto_X is not None:
+        print(f"\nPareto front: {len(pareto_X)} solutions ({n_feasible} feasible)")
+        # Best L/D on Pareto front
+        ld_vals = [-f[0] for f in pareto_F]
+        mass_vals = [f[1] for f in pareto_F]
+        print(f"  L/D range:  [{min(ld_vals):.2f}, {max(ld_vals):.2f}]")
+        print(f"  Mass range: [{min(mass_vals)*1000:.0f}, {max(mass_vals)*1000:.0f}] g")
+
+    return {
+        "pareto_X": pareto_X,
+        "pareto_F": pareto_F,
+        "pareto_results": pareto_results,
+        "pymoo_result": res,
+        "n_pareto": len(pareto_X) if pareto_X is not None else 0,
+        "n_feasible": n_feasible,
+    }
+
+
 # Default entry point
 def run_optimization(
     mission: MissionCondition | None = None,
@@ -426,10 +538,12 @@ def run_optimization(
     method: str = "de",
     **kwargs,
 ) -> dict:
-    """Run optimization with specified method ('de' or 'surrogate')."""
+    """Run optimization with specified method ('de', 'surrogate', or 'nsga2')."""
     if method == "de":
         return run_differential_evolution(mission=mission, feasibility=feasibility, **kwargs)
     elif method == "surrogate":
         return run_surrogate_assisted(mission=mission, feasibility=feasibility, **kwargs)
+    elif method == "nsga2":
+        return run_nsga2(mission=mission, feasibility=feasibility, **kwargs)
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'de' or 'surrogate'.")
+        raise ValueError(f"Unknown method: {method}. Use 'de', 'surrogate', or 'nsga2'.")

@@ -21,7 +21,12 @@ from .features import augment_features
 PRIMITIVE_TARGETS = [
     "CL_0", "CL_alpha", "CM_0", "CM_alpha",
     "CD0_wing", "CD0_body", "Cn_beta",
+    # v2: control surface derivatives (added by retrofit script)
+    "Cl_beta", "CLd01", "Cmd01",
 ]
+
+# Backward-compatible: the original 7 targets for loading legacy models
+_LEGACY_TARGETS = PRIMITIVE_TARGETS[:7]
 
 # Physical bounds for filtering divergent VLM outputs before training.
 _TARGET_CLIP = {
@@ -32,6 +37,10 @@ _TARGET_CLIP = {
     "CD0_wing":  (0.001, 0.080),    # NeuralFoil-based, unchanged
     "CD0_body":  (0.0005, 0.050),   # Analytical, unchanged
     "Cn_beta":   (-0.5, 2.0),       # AVL P1/P99: -0.04 / 0.99; tightened from (-5,5)
+    # v2 control derivatives
+    "Cl_beta":   (-2.0, 0.5),       # Roll due to sideslip (negative = stable dihedral effect)
+    "CLd01":     (-0.01, 0.30),     # CL per rad elevon deflection
+    "Cmd01":     (-0.10, 0.01),     # Cm per rad elevon (negative = nose-down for TE-down)
 }
 
 
@@ -79,6 +88,7 @@ class SurrogateModel:
     """
 
     n_ensemble: int = 5
+    _n_targets: int = 10            # 7 for legacy, 10 for v2 (with control derivatives)
     _models: list = field(default_factory=list, repr=False)
     _scaler_X: StandardScaler = field(default_factory=StandardScaler, repr=False)
     _scaler_Y: StandardScaler = field(default_factory=StandardScaler, repr=False)
@@ -119,7 +129,20 @@ class SurrogateModel:
             cd0_body = r.get("CD0_body", r.get("CD0", 0.008) * 0.4)
             cn_beta = r.get("Cn_beta", 0.0)
 
+            # v2 control derivatives (from regeneration script)
+            # Uses "Cl_beta" regenerated with consistent s_ref/b_ref normalization.
+            cl_beta = r.get("Cl_beta", None)
+            cl_d01 = r.get("CLd01", None)
+            cmd01 = r.get("Cmd01", None)
+
+            # Skip samples without control derivatives if we need 10 targets
+            if self._n_targets == 10 and (cl_d01 is None or cmd01 is None):
+                continue
+
             row = [cl_0, cl_alpha, cm_0, cm_alpha, cd0_wing, cd0_body, cn_beta]
+            if self._n_targets == 10:
+                row.extend([cl_beta or 0.0, cl_d01, cmd01])
+
             Y_rows.append(row)
             valid_indices.append(i)
 
@@ -251,8 +274,13 @@ class SurrogateModel:
                 preds.append(Y)
         return np.array(preds)
 
+    @property
+    def target_keys(self) -> list[str]:
+        """Target keys this model predicts (7 for legacy, 10 for v2)."""
+        return PRIMITIVE_TARGETS[:self._n_targets]
+
     def predict(self, X: np.ndarray) -> dict:
-        """Predict 7 VLM primitives (ensemble mean)."""
+        """Predict VLM primitives (ensemble mean). Returns 7 or 10 targets."""
         if not self._is_trained:
             raise RuntimeError("Surrogate not trained yet.")
 
@@ -261,7 +289,8 @@ class SurrogateModel:
             X = X.reshape(1, -1)
 
         mean = self._predict_ensemble(X).mean(axis=0)
-        result = {key: mean[:, i] for i, key in enumerate(PRIMITIVE_TARGETS)}
+        keys = self.target_keys
+        result = {key: mean[:, i] for i, key in enumerate(keys)}
 
         if single:
             result = {k: float(v[0]) for k, v in result.items()}
@@ -280,8 +309,9 @@ class SurrogateModel:
         mean = preds.mean(axis=0)
         std = preds.std(axis=0)
 
-        mean_dict = {key: mean[:, i] for i, key in enumerate(PRIMITIVE_TARGETS)}
-        std_dict = {key: std[:, i] for i, key in enumerate(PRIMITIVE_TARGETS)}
+        keys = self.target_keys
+        mean_dict = {key: mean[:, i] for i, key in enumerate(keys)}
+        std_dict = {key: std[:, i] for i, key in enumerate(keys)}
 
         if single:
             mean_dict = {k: float(v[0]) for k, v in mean_dict.items()}
@@ -314,8 +344,9 @@ class SurrogateModel:
         meta = {
             "n_ensemble": self.n_ensemble,
             "layers": list(self._layers_used),
-            "target_keys": list(PRIMITIVE_TARGETS),
+            "target_keys": list(self.target_keys),
             "n_features_aug": self._scaler_X.n_features_in_,
+            "n_targets": self._n_targets,
         }
         (path / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -333,6 +364,7 @@ class SurrogateModel:
         n_targets = len(meta["target_keys"])
 
         sm = cls(n_ensemble=meta["n_ensemble"])
+        sm._n_targets = meta.get("n_targets", len(meta["target_keys"]))
         sm._device = device
         sm._layers_used = layers
         sm._scaler_X = joblib.load(path / "scaler_X.pkl")

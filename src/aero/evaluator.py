@@ -1,11 +1,13 @@
-"""Aerodynamic evaluator — AVL + drag + stability + propulsion.
+"""Aerodynamic evaluator — AVL + drag + stability + propulsion + CG.
 
 Uses AVL for inviscid aerodynamics and direct stability derivatives
 (CL_0, CL_alpha, CM_0, CM_alpha, Cn_beta), plus NeuralFoil/analytical
 for viscous drag.
 
+v2: Adds control surface support (elevon trim) and real CG computation.
+
 Produces 7 surrogate primitives plus full derived quantities including
-propulsion balance (T/D, endurance).
+propulsion balance (T/D, endurance) and control authority.
 """
 
 import numpy as np
@@ -16,11 +18,13 @@ from ..parameterization.bwb_aircraft import (
 )
 from .mission import MissionCondition, FeasibilityConfig, DEFAULT_FEASIBILITY
 from .drag import compute_wing_cd0, compute_body_cd0, oswald_efficiency
-from .avl_runner import run_avl_stability
+from .avl_runner import run_avl_stability, ControlConfig
 from ..propulsion.edf_model import (
     thrust_at_speed, endurance as compute_endurance_full,
     duct_fits_in_body, intake_drag,
 )
+from ..systems.cg import compute_cg, CGConfig, DEFAULT_CG_CONFIG
+from ..evaluation.manufacturability import compute_manufacturability
 
 _DEFAULT_AVL_CMD = "d:/UAV/tools/avl/avl.exe"
 
@@ -31,33 +35,62 @@ class AeroEvaluator:
     def __init__(self, mission: MissionCondition | None = None,
                  feasibility: FeasibilityConfig | None = None,
                  use_neuralfoil: bool = True,
-                 avl_command: str = _DEFAULT_AVL_CMD):
+                 avl_command: str = _DEFAULT_AVL_CMD,
+                 controls: ControlConfig | None = None,
+                 cg_config: CGConfig | None = None,
+                 use_cg: bool = True):
         self.mission = mission or MissionCondition()
         self.feasibility = feasibility or DEFAULT_FEASIBILITY
         self.use_neuralfoil = use_neuralfoil
         self.avl_command = avl_command
+        self.controls = controls or ControlConfig.default_bwb()
+        self.cg_config = cg_config or DEFAULT_CG_CONFIG
+        self.use_cg = use_cg
 
     def evaluate(self, params: BWBParams) -> dict:
-        """Full aero + stability + propulsion evaluation.
+        """Full aero + stability + propulsion + control evaluation.
 
         Uses two AVL runs:
         1. alpha=0 -> CL_0, CM_0, CL_alpha, CM_alpha, Cn_beta
-        2. alpha=trim -> CL, CM at operating point
+        2. alpha=trim -> CL, CM at operating point (with elevon trim)
 
-        Returns dict with 7 primitives, derived quantities, and propulsion balance.
+        Returns dict with 7 primitives, derived quantities, propulsion balance,
+        and control authority metrics.
         """
         mission = self.mission
-        airplane = build_airplane(params)
+
+        # ── Compute real CG ──
+        x_cg = None
+        cg_result = None
+        if self.use_cg:
+            cg_result = compute_cg(
+                params,
+                battery_mass=mission.battery_mass,
+                edf_mass=mission.motor_mass,
+                avionics_mass=mission.avionics_mass,
+                config=self.cg_config,
+            )
+            x_cg = cg_result["x_cg"]
+
+        airplane = build_airplane(params, x_cg=x_cg)
         s_ref = compute_wing_area(params)
         mac = compute_mac(params)
         ar = compute_aspect_ratio(params)
         cl_required = mission.weight / (mission.dynamic_pressure * s_ref)
+
+        # Default control derivative values
+        elevon_deflection = 0.0
+        cl_de = 0.0
+        cm_de = 0.0
+        cl_da = 0.0
+        cn_da = 0.0
 
         try:
             # AVL at alpha=0: get CL_0, CM_0 + all stability derivatives
             avl0 = run_avl_stability(
                 airplane, alpha=0.0, velocity=mission.velocity,
                 avl_command=self.avl_command,
+                controls=self.controls,
             )
             if avl0 is None:
                 raise RuntimeError("AVL failed at alpha=0")
@@ -69,6 +102,13 @@ class AeroEvaluator:
             cn_beta = avl0["Cnb"]       # direct analytical derivative
             cl_beta = avl0.get("Clb", 0.0)
 
+            # Extract control derivatives if available
+            # AVL uses CLd01, Cmd01 format (zero-padded index)
+            cl_de = avl0.get("CLd01", avl0.get("CLd1", 0.0))
+            cm_de = avl0.get("Cmd01", avl0.get("Cmd1", 0.0))
+            cl_da = avl0.get("Cld02", avl0.get("Cld2", 0.0))
+            cn_da = avl0.get("Cnd02", avl0.get("Cnd2", 0.0))
+
             # Trim alpha from linearized CL(alpha) = CL_0 + CL_alpha * alpha
             if abs(cl_alpha) > 0.1:
                 alpha_eq = np.degrees((cl_required - cl_0) / cl_alpha)
@@ -76,16 +116,26 @@ class AeroEvaluator:
                 alpha_eq = 5.0
             alpha_eq = float(np.clip(alpha_eq, -2, 12))
 
-            # AVL at trim alpha: get CL, CM at operating point
+            # AVL at trim alpha: with elevon trim (CM→0)
             avl_t = run_avl_stability(
                 airplane, alpha=alpha_eq, velocity=mission.velocity,
                 avl_command=self.avl_command,
+                controls=self.controls,
             )
             if avl_t is None:
                 raise RuntimeError("AVL failed at trim alpha")
 
             cl = avl_t["CL"]
             cm = avl_t["Cm"]
+
+            # Get trim elevon deflection from AVL output
+            elevon_deflection = avl_t.get("delta_elevon", 0.0)
+
+            # Update control derivatives from trim run (more accurate)
+            cl_de = avl_t.get("CLd01", cl_de)
+            cm_de = avl_t.get("Cmd01", cm_de)
+            cl_da = avl_t.get("Cld02", cl_da)
+            cn_da = avl_t.get("Cnd02", cn_da)
 
             success = True
         except Exception:
@@ -117,7 +167,17 @@ class AeroEvaluator:
         cd0 = cd0_wing + cd0_body
         e = oswald_efficiency(ar, params.le_sweep_deg, params.taper_ratio)
         cd_induced = cl**2 / (np.pi * ar * e) if ar > 1.0 else 0.1
-        cd = cd0 + cd_induced
+
+        # Trim drag: additional induced drag from elevon deflection
+        # Approximate: delta_CD_trim ≈ (CL_de * delta_e)^2 / (pi * AR * e)
+        # plus profile drag increment ≈ 0.0001 * |delta_e_deg| / 10
+        cd_trim = 0.0
+        if abs(elevon_deflection) > 0.1:
+            delta_cl_trim = cl_de * np.radians(elevon_deflection)
+            cd_trim = (delta_cl_trim ** 2 / (np.pi * ar * e) if ar > 1.0 else 0.0)
+            cd_trim += 0.0001 * abs(elevon_deflection) / 10.0  # profile drag increment
+
+        cd = cd0 + cd_induced + cd_trim
         l_over_d = cl / cd if cd > 1e-4 else 0.0
         cd_effective = cd * self.feasibility.drag_margin
 
@@ -143,22 +203,32 @@ class AeroEvaluator:
         body_chord = params.body_root_chord
         duct_ok = duct_fits_in_body(params.body_tc_root, body_chord, mission.edf)
 
+        # Manufacturability score (geometry-only, no AVL needed)
+        manuf = compute_manufacturability(params)
+        manuf_score = manuf["manufacturability_score"]
+
         # ── Feasibility ──
         is_feasible = fc.is_feasible(
             static_margin, cm, struct_mass, mission.mass_budget,
             cl_required, ar, internal_volume, cn_beta,
             t_over_d, endurance_s, duct_ok, success,
             vs=vs, alpha_trim=alpha_eq,
+            elevon_deflection=elevon_deflection,
+            cl_beta=cl_beta,
+            manufacturability_score=manuf_score,
         )
         penalty, constraints = fc.compute_penalty(
             static_margin, cm, struct_mass, mission.mass_budget,
             cl_required, ar, internal_volume, cn_beta,
             t_over_d, endurance_s, duct_ok,
             vs=vs, alpha_trim=alpha_eq,
+            elevon_deflection=elevon_deflection,
+            cl_beta=cl_beta,
+            manufacturability_score=manuf_score,
         )
 
-        return {
-            # 7 surrogate primitives
+        result = {
+            # 7 surrogate primitives (unchanged for backward compat)
             "CL_0": cl_0,
             "CL_alpha": cl_alpha,
             "CM_0": cm_0,
@@ -171,6 +241,7 @@ class AeroEvaluator:
             "CD": cd,
             "CD0": cd0,
             "CDi": cd_induced,
+            "CD_trim": cd_trim,
             "CD_effective": cd_effective,
             "CM": cm,
             "L_over_D": l_over_d,
@@ -182,6 +253,17 @@ class AeroEvaluator:
             "S_ref": s_ref,
             "AR": ar,
             "MAC": mac,
+            # Control authority
+            "elevon_deflection": elevon_deflection,
+            "CL_de": cl_de,
+            "Cm_de": cm_de,
+            "Cl_da": cl_da,
+            "Cn_da": cn_da,
+            # CG
+            "x_cg": x_cg if x_cg is not None else params.body_root_chord * 0.30,
+            "x_cg_frac": (x_cg / body_chord if x_cg else 0.30),
+            # Manufacturability
+            "manufacturability_score": manuf_score,
             # Structure
             "struct_mass": struct_mass,
             "internal_volume": internal_volume,
@@ -202,6 +284,11 @@ class AeroEvaluator:
             "constraints": constraints,
             "success": success,
         }
+
+        if cg_result:
+            result["cg_components"] = cg_result["components"]
+
+        return result
 
 def quick_eval(params: BWBParams, mission: MissionCondition | None = None) -> dict:
     """Convenience function for single evaluation."""

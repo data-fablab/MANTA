@@ -149,9 +149,14 @@ def build_body_airfoil(
     xl = x
     yl = yc - yt
 
-    # Close TE
-    yu[-1] = 0.0
-    yl[-1] = 0.0
+    # Smooth TE closure: blend to y=0 over last 5% chord
+    # Avoids the sharp corner caused by reflex + forced closure
+    te_blend_start = 0.95
+    te_mask = x > te_blend_start
+    te_frac = (x[te_mask] - te_blend_start) / (1.0 - te_blend_start)  # 0→1
+    blend = (1.0 - te_frac ** 2)  # smooth ramp to 0
+    yu[te_mask] *= blend
+    yl[te_mask] *= blend
 
     # Assemble in Selig format (upper TE→LE then lower LE→TE)
     coords_upper = np.column_stack([xu[::-1], yu[::-1]])
@@ -171,7 +176,7 @@ def _cosine_spacing(n: int) -> np.ndarray:
 # Aircraft assembly
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_airplane(params: BWBParams) -> asb.Airplane:
+def build_airplane(params: BWBParams, x_cg: float | None = None) -> asb.Airplane:
     """Build AeroSandbox Airplane with center-body + outer wing.
 
     The center-body is modeled as a separate asb.Wing (symmetric=True)
@@ -179,15 +184,37 @@ def build_airplane(params: BWBParams) -> asb.Airplane:
 
     The outer wing is modeled as a separate asb.Wing (symmetric=True)
     with 6 stations from y = body_hw to y = half_span.
+
+    Parameters
+    ----------
+    params : BWBParams
+        Aircraft geometry parameters.
+    x_cg : float, optional
+        CG x-position [m] from body LE. If None, uses fallback (0.30 × body chord).
     """
     body_wing = _build_center_body(params)
     outer_wing = _build_outer_wing(params)
 
-    # CG reference: 25% MAC of the combined wing, approximated at body LE + 25% body chord
-    x_ref = params.body_root_chord * 0.30
+    # CG reference: computed from component placement or fallback
+    if x_cg is not None:
+        x_ref = x_cg
+    else:
+        # Fallback: approximate CG at 30% body root chord
+        x_ref = params.body_root_chord * 0.30
+
+    # Explicit reference quantities for consistent AVL normalization.
+    # s_ref = total projected wing area, c_ref = mean geometric chord,
+    # b_ref = full span. This ensures CM_alpha / CL_alpha gives SM
+    # in units of c_ref, matching the CG correction in reconstruct.py.
+    s = compute_wing_area(params)
+    span = 2 * params.half_span
+    c = s / span  # mean geometric chord
     airplane = asb.Airplane(
         name="nEUROn BWB v2",
         xyz_ref=[x_ref, 0, 0],
+        s_ref=s,
+        c_ref=c,
+        b_ref=span,
         wings=[body_wing, outer_wing],
     )
     return airplane

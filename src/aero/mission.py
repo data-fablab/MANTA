@@ -115,6 +115,11 @@ class FeasibilityConfig:
 
     # ── Control authority constraints ──
     alpha_trim_max: float = 10.0   # [deg] max trim alpha
+    elevon_deflection_max: float = 15.0  # [deg] max trim elevon deflection
+    cl_beta_cn_beta_max: float = -30.0   # max |Cl_beta/Cn_beta| ratio (dutch roll)
+
+    # ── Manufacturability constraint ──
+    manufacturability_min: float = 0.40  # min composite score [0-1]
 
     # ── Aerodynamic penalty weights ──
     w_sm_lo: float = 20.0
@@ -134,6 +139,9 @@ class FeasibilityConfig:
     # ── Stall / control penalty weights ──
     w_vs: float = 20.0            # stall speed (critical: can't land)
     w_alpha_trim: float = 10.0    # trim alpha out of range
+    w_elevon_defl: float = 15.0   # elevon deflection too large for trim
+    w_dutch_roll: float = 10.0    # Cl_beta/Cn_beta ratio (lateral coupling)
+    w_manufacturability: float = 10.0  # manufacturability score too low
 
     def compute_penalty(
         self,
@@ -150,6 +158,9 @@ class FeasibilityConfig:
         duct_fits: bool | None = None,
         vs: float | None = None,
         alpha_trim: float | None = None,
+        elevon_deflection: float | None = None,
+        cl_beta: float | None = None,
+        manufacturability_score: float | None = None,
     ) -> tuple[float, dict]:
         """Compute total penalty and constraint violations.
 
@@ -224,6 +235,26 @@ class FeasibilityConfig:
             constraints["g_alpha_trim_lo"] = g_alpha_lo
             constraints["g_alpha_trim_hi"] = g_alpha_hi
 
+        # ── Elevon deflection constraint ──
+        if elevon_deflection is not None:
+            g_elev = abs(elevon_deflection) - self.elevon_deflection_max
+            penalty += self.w_elevon_defl * max(0, g_elev / max(self.elevon_deflection_max, 1.0))
+            constraints["g_elevon_defl"] = g_elev
+
+        # ── Dutch roll lateral coupling ──
+        if cl_beta is not None and cn_beta is not None and cn_beta > 0.001:
+            ratio = cl_beta / cn_beta
+            g_dutch = ratio - self.cl_beta_cn_beta_max  # ratio is negative, max is negative
+            # Penalize if ratio is too negative (strong adverse coupling)
+            penalty += self.w_dutch_roll * max(0, -g_dutch / max(abs(self.cl_beta_cn_beta_max), 1.0))
+            constraints["g_dutch_roll"] = g_dutch
+
+        # ── Manufacturability constraint ──
+        if manufacturability_score is not None:
+            g_manuf = self.manufacturability_min - manufacturability_score
+            penalty += self.w_manufacturability * max(0, g_manuf / max(self.manufacturability_min, 0.01))
+            constraints["g_manufacturability"] = g_manuf
+
         return penalty, constraints
 
     def is_feasible(
@@ -242,6 +273,9 @@ class FeasibilityConfig:
         success: bool = True,
         vs: float | None = None,
         alpha_trim: float | None = None,
+        elevon_deflection: float | None = None,
+        cl_beta: float | None = None,
+        manufacturability_score: float | None = None,
     ) -> bool:
         """Check if all constraints are satisfied."""
         checks = [
@@ -266,6 +300,12 @@ class FeasibilityConfig:
             checks.append(vs <= self.vs_max)
         if alpha_trim is not None:
             checks.append(-2.0 <= alpha_trim <= self.alpha_trim_max)
+        if elevon_deflection is not None:
+            checks.append(abs(elevon_deflection) <= self.elevon_deflection_max)
+        if cl_beta is not None and cn_beta is not None and cn_beta > 0.001:
+            checks.append(cl_beta / cn_beta >= self.cl_beta_cn_beta_max)
+        if manufacturability_score is not None:
+            checks.append(manufacturability_score >= self.manufacturability_min)
         return all(checks)
 
 

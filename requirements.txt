@@ -10,3 +10,5 @@ pandas>=2.0
 pyarrow>=14.0
 ipykernel>=6.0
 ipywidgets>=8.0
+pyyaml>=6.0
+pymoo>=0.6

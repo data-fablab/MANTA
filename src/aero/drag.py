@@ -33,7 +33,8 @@ def compute_wing_cd0(
     outer_span = p.outer_half_span
     root_chord = p.wing_root_chord
     tip_chord = p.tip_chord
-    twists = [0.0, p.twist_1, p.twist_2, p.twist_3, p.twist_4, p.twist_tip]
+    twist_055 = p.twist_2 + (0.55 - 0.50) / (0.75 - 0.50) * (p.twist_3 - p.twist_2)
+    twists = [0.0, p.twist_1, p.twist_2, twist_055, p.twist_3, p.twist_4, p.twist_tip]
 
     s_ref = _compute_outer_wing_area(p)
     cd_total = 0.0

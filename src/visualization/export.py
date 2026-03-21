@@ -894,7 +894,7 @@ def _build_oml_solid(
     from OCP.Approx import Approx_ChordLength
     from OCP.gp import gp_Pnt, gp_Trsf, gp_Ax2, gp_Dir
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
-    from .step_booleans import robust_fuse
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
 
     p = params
 
@@ -920,19 +920,17 @@ def _build_oml_solid(
         raise RuntimeError("BRepOffsetAPI_ThruSections loft failed")
     right_solid = loft.Shape()
 
-    # Mirror across XZ plane
+    # Mirror across XZ plane and fuse both halves
+    # Note: BRepAlgoAPI_Fuse is used directly here (not CellsBuilder)
+    # because CellsBuilder can return incomplete results for mirror fuses.
     trsf = gp_Trsf()
     trsf.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)))
     left_solid = BRepBuilderAPI_Transform(right_solid, trsf, True).Shape()
 
-    # Fuse both halves (robust pipeline with sewing fallback)
-    fused_result, fuse_msg = robust_fuse(
-        right_solid, left_solid, label="oml-halves",
-    )
-    if fused_result is not None:
-        oml_solid = fused_result
-    else:
-        warnings.warn("Robust fuse failed (%s), falling back to sewing" % fuse_msg)
+    fuse = BRepAlgoAPI_Fuse(right_solid, left_solid)
+    fuse.Build()
+    if not fuse.IsDone():
+        warnings.warn("Direct fuse failed, falling back to sewing")
         from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
         from OCP.TopoDS import TopoDS
 
@@ -942,6 +940,8 @@ def _build_oml_solid(
         sew.Perform()
         sewn = sew.SewedShape()
         oml_solid = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn)).Solid()
+    else:
+        oml_solid = fuse.Shape()
 
     return oml_solid, all_sections, dense_sections
 

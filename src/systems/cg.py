@@ -140,18 +140,26 @@ def compute_cg(
         x_cg=body_chord * config.edf_xc,
     ))
 
-    # ── Avionics ──
-    components.append(ComponentPlacement(
-        "avionics", avionics_mass,
-        x_cg=body_chord * config.avionics_xc,
-    ))
-
-    # ── Servos ──
-    if config.servo_mass > 0:
+    # ── Avionics (detailed BOM or placeholder) ──
+    try:
+        from .avionics import AvionicsSpec
+        avionics_spec = AvionicsSpec.default_bwb()
+        for ac in avionics_spec.components:
+            components.append(ComponentPlacement(
+                ac.name, ac.mass_g / 1000.0,
+                x_cg=body_chord * ac.position_xc,
+            ))
+    except ImportError:
+        # Fallback to placeholder
         components.append(ComponentPlacement(
-            "servos", config.servo_mass,
-            x_cg=body_chord * config.servo_xc,
+            "avionics", avionics_mass,
+            x_cg=body_chord * config.avionics_xc,
         ))
+        if config.servo_mass > 0:
+            components.append(ComponentPlacement(
+                "servos", config.servo_mass,
+                x_cg=body_chord * config.servo_xc,
+            ))
 
     # ── Weighted CG computation ──
     total_mass = sum(c.mass for c in components)

@@ -25,7 +25,7 @@ class MissionCondition:
     mtow: float = 1.5              # [kg] max takeoff weight
 
     # Fixed component masses
-    avionics_mass: float = 0.10     # [kg] servos + receiver + wiring + sensors
+    avionics_mass: float = 0.168    # [kg] detailed BOM (see systems/avionics.py)
 
     # Propulsion system (fixed hardware)
     edf: EDFSpec = field(default_factory=lambda: EDF_70MM)

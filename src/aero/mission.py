@@ -24,8 +24,9 @@ class MissionCondition:
     altitude: float = 100.0         # [m] altitude
     mtow: float = 1.5              # [kg] max takeoff weight
 
-    # Fixed component masses
-    avionics_mass: float = 0.168    # [kg] detailed BOM (see systems/avionics.py)
+    # Fixed component masses (see systems/avionics.py for detailed BOM)
+    avionics_mass: float = 0.179    # [kg] detailed BOM (FC, Rx, GPS, ESC, servos, FPV, etc.)
+    auxiliary_mass: float = 0.080   # [kg] linkages, camera window, FC mount, battery box
 
     # Propulsion system (fixed hardware)
     edf: EDFSpec = field(default_factory=lambda: EDF_70MM)
@@ -42,9 +43,26 @@ class MissionCondition:
         return self.battery.mass
 
     @property
+    def duct_mass(self) -> float:
+        """Duct structure mass [kg] (wall + mounting hardware)."""
+        try:
+            from ..propulsion.duct_geometry import (
+                compute_duct_placement, compute_duct_structure_mass,
+            )
+            from ..parameterization.design_variables import BWBParams
+            # Use default params for duct mass estimate (placement varies
+            # little across the design space since duct dimensions come
+            # from EDF spec, not wing geometry).
+            placement = compute_duct_placement(BWBParams(), self.edf)
+            return compute_duct_structure_mass(placement)
+        except Exception:
+            return 0.19  # fallback estimate for 70mm EDF
+
+    @property
     def mass_budget(self) -> float:
         """Available mass for airframe structure [kg]."""
-        return self.mtow - self.battery_mass - self.motor_mass - self.avionics_mass
+        return (self.mtow - self.battery_mass - self.motor_mass
+                - self.avionics_mass - self.auxiliary_mass - self.duct_mass)
 
     @property
     def atmosphere(self) -> asb.Atmosphere:

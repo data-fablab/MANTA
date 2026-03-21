@@ -140,6 +140,21 @@ def compute_cg(
         x_cg=body_chord * config.edf_xc,
     ))
 
+    # ── Duct structure ──
+    try:
+        from ..propulsion.duct_geometry import (
+            compute_duct_placement, compute_duct_structure_mass,
+        )
+        from ..propulsion.edf_model import EDF_70MM
+        placement = compute_duct_placement(params, EDF_70MM)
+        duct_mass = compute_duct_structure_mass(placement)
+        components.append(ComponentPlacement(
+            "duct_structure", duct_mass,
+            x_cg=body_chord * placement.fan_x_frac,  # CG near fan face
+        ))
+    except Exception:
+        pass  # no propulsion module or duct computation failed
+
     # ── Avionics (detailed BOM or placeholder) ──
     try:
         from .avionics import AvionicsSpec

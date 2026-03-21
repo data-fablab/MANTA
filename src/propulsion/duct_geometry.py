@@ -125,7 +125,7 @@ def compute_duct_placement(params: BWBParams, edf: EDFSpec) -> DuctPlacement:
     exhaust_height = exit_area / exhaust_width
 
     # ── Duct dimensions ──
-    duct_wall = 0.002  # 2mm wall thickness (composite/3D print)
+    duct_wall = 0.001  # 1mm wall (carbon prepreg or 3D print LW-PLA)
     housing_length = edf.fan_diameter * 1.5  # motor + fan assembly length
 
     return DuctPlacement(
@@ -149,6 +149,54 @@ def compute_duct_placement(params: BWBParams, edf: EDFSpec) -> DuctPlacement:
         housing_length=housing_length,
         body_chord=body_chord,
     )
+
+
+def compute_duct_structure_mass(
+    placement: DuctPlacement,
+    material_density: float = 1500.0,
+) -> float:
+    """Estimate mass of the duct wall structure (carbon composite).
+
+    Computes the wall volume from the duct cross-section envelope along
+    the full centerline (intake→exhaust), multiplied by composite density.
+    Adds 30% for flanges, mounting pylons, firewall, and fasteners.
+
+    Parameters
+    ----------
+    placement : DuctPlacement
+    material_density : float
+        Composite density [kg/m³]. Default 1500 (carbon-epoxy).
+
+    Returns
+    -------
+    float : duct structure mass [kg] (wall + 30% mounting hardware).
+    """
+    centerline = compute_duct_centerline(placement, n_pts=40)
+    wall_t = placement.duct_wall_thickness  # [m]
+
+    x_start = centerline[0, 0]
+    x_end = centerline[-1, 0]
+    x_span = max(x_end - x_start, 1e-9)
+
+    wall_volume = 0.0
+    for i in range(len(centerline) - 1):
+        cx = (centerline[i, 0] + centerline[i + 1, 0]) / 2
+        t = np.clip((cx - x_start) / x_span, 0.0, 1.0)
+
+        # Cross-section at this station
+        cs = duct_cross_section(t, placement, n_pts=32)
+        # Perimeter ≈ sum of point-to-point distances
+        cs_closed = np.vstack([cs, cs[0]])
+        perimeter = float(np.sum(np.sqrt(np.diff(cs_closed[:, 0])**2 +
+                                          np.diff(cs_closed[:, 1])**2)))
+
+        # Segment length along centerline
+        dx = float(np.linalg.norm(centerline[i + 1] - centerline[i]))
+
+        wall_volume += perimeter * wall_t * dx
+
+    wall_mass = wall_volume * material_density
+    return wall_mass * 1.30  # +30% for flanges, pylons, firewall
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -97,21 +97,23 @@ class AvionicsSpec:
                       position_xc=0.33, price_eur=8,
                       notes="Battery monitoring, mAh counter, OSD voltage"),
 
-            # --- Servos (4x for elevons + ailerons) ---
+            # --- Servos (4x, all in wing at hinge line) ---
             Component("Servo elevon L", "Emax ES3004",
-                      mass_g=17, dimensions_mm=(32, 12, 30),
+                      mass_g=17, dimensions_mm=(32, 12, 10),
                       position_xc=0.70, power_w=2.0, price_eur=8,
-                      notes="17g metal gear, 3.5 kg.cm @ 6V"),
+                      notes="Wing-mounted at hinge, flat orientation"),
             Component("Servo elevon R", "Emax ES3004",
-                      mass_g=17, dimensions_mm=(32, 12, 30),
-                      position_xc=0.70, power_w=2.0, price_eur=8),
-            Component("Servo aileron L", "Emax ES3004",
-                      mass_g=17, dimensions_mm=(32, 12, 30),
+                      mass_g=17, dimensions_mm=(32, 12, 10),
                       position_xc=0.70, power_w=2.0, price_eur=8,
-                      notes="Mounted in wing, pushrod to hinge"),
+                      notes="Wing-mounted at hinge, flat orientation"),
+            Component("Servo aileron L", "Emax ES3004",
+                      mass_g=17, dimensions_mm=(32, 12, 10),
+                      position_xc=0.70, power_w=2.0, price_eur=8,
+                      notes="Wing-mounted at hinge, flat orientation"),
             Component("Servo aileron R", "Emax ES3004",
-                      mass_g=17, dimensions_mm=(32, 12, 30),
-                      position_xc=0.70, power_w=2.0, price_eur=8),
+                      mass_g=17, dimensions_mm=(32, 12, 10),
+                      position_xc=0.70, power_w=2.0, price_eur=8,
+                      notes="Wing-mounted at hinge, flat orientation"),
 
             # --- FPV ---
             Component("Camera FPV", "Caddx Ant Nano",
@@ -190,11 +192,13 @@ def compute_component_positions_3d(
 ) -> list[dict]:
     """Convert x/c placements to 3D positions and check envelope fit.
 
-    Each component is placed at its x/c position along the body chord,
-    centered laterally (y=0) and vertically at the body camber line.
-    The bounding box is checked against the local body envelope.
+    Components inside the duct zone (intake→exhaust) are placed
+    **above** the duct cross-section.  Components outside the duct zone
+    or explicitly in the wing (servos at x/c=0.70) use the full body
+    envelope.
 
-    Returns list of dicts with: name, position_mm, bbox_mm, fits, clearance_mm.
+    Returns list of dicts with: name, position_mm, bbox_mm, fits,
+    clearance_mm, zone ('above_duct', 'below_duct', 'forward', 'wing').
     """
     if avionics is None:
         avionics = AvionicsSpec.default_bwb()
@@ -208,29 +212,96 @@ def compute_component_positions_3d(
         reflex=p.body_reflex, le_droop=p.body_le_droop,
         n_pts=200,
     )
-    coords = af.coordinates  # (N, 2) normalized [0,1]
-    mid = np.argmin(coords[:, 0])
-    upper_x = coords[:mid + 1, 0][::-1]
-    upper_z = coords[:mid + 1, 1][::-1]
-    lower_x = coords[mid:, 0]
-    lower_z = coords[mid:, 1]
+    coords = af.coordinates
+    mid_idx = np.argmin(coords[:, 0])
+    upper_x = coords[:mid_idx + 1, 0][::-1]
+    upper_z = coords[:mid_idx + 1, 1][::-1]
+    lower_x = coords[mid_idx:, 0]
+    lower_z = coords[mid_idx:, 1]
+
+    # Duct envelope (if propulsion available)
+    duct_top_at_xc = None
+    duct_bot_at_xc = None
+    duct_xc_min = 1.0
+    duct_xc_max = 0.0
+    try:
+        from ..propulsion.duct_geometry import (
+            compute_duct_placement, compute_duct_centerline, duct_cross_section,
+        )
+        from ..propulsion.edf_model import EDF_70MM
+
+        placement = compute_duct_placement(p, EDF_70MM)
+        centerline = compute_duct_centerline(placement, n_pts=60)
+        x_start = centerline[0, 0]
+        x_end = centerline[-1, 0]
+        duct_xc_min = x_start / bc
+        duct_xc_max = x_end / bc
+
+        # Precompute duct envelope at fine x/c resolution
+        _duct_xc = []
+        _duct_top = []
+        _duct_bot = []
+        for i in range(len(centerline)):
+            cx, _, cz = centerline[i]
+            t = np.clip((cx - x_start) / max(x_end - x_start, 1e-9), 0, 1)
+            cs = duct_cross_section(t, placement, n_pts=32)
+            _duct_xc.append(cx / bc)
+            _duct_top.append((cz + cs[:, 1].max()) * 1000)
+            _duct_bot.append((cz + cs[:, 1].min()) * 1000)
+        _duct_xc = np.array(_duct_xc)
+        _duct_top_arr = np.array(_duct_top)
+        _duct_bot_arr = np.array(_duct_bot)
+
+        def duct_top_at_xc(xc):
+            return float(np.interp(xc, _duct_xc, _duct_top_arr))
+
+        def duct_bot_at_xc(xc):
+            return float(np.interp(xc, _duct_xc, _duct_bot_arr))
+    except (ImportError, Exception):
+        pass  # no propulsion module, ignore duct
 
     results = []
     for c in avionics.components:
         xc = c.position_xc
         x_mm = xc * bc * 1000
 
-        # Local body envelope at this x/c
+        # Body envelope
         z_up = float(np.interp(xc, upper_x, upper_z)) * bc * 1000
         z_lo = float(np.interp(xc, lower_x, lower_z)) * bc * 1000
-        z_center = (z_up + z_lo) / 2
-        height_avail = z_up - z_lo
 
         L, W, H = c.dimensions_mm
-        half_h = H / 2
+        in_wing = "servo" in c.name.lower() or "LED" in c.name
+        is_external = "antenna" in c.name.lower()
 
-        fits = H <= height_avail * 0.85  # 15% margin
-        clearance = (height_avail - H) / 2
+        if is_external:
+            # External components (antennas): protrude through skin
+            zone = "external"
+            z_center = z_up  # on skin surface
+            height_avail = 50.0  # no constraint (external)
+        elif in_wing:
+            # Wing-mounted components: constrained by wing t/c at hinge
+            zone = "wing"
+            z_center = z_lo
+            height_avail = 20.0  # wing t/c provides ~15-20mm at hinge
+        elif duct_top_at_xc is not None and duct_xc_min <= xc <= duct_xc_max:
+            # Inside duct zone: place ABOVE the duct
+            d_top = duct_top_at_xc(xc)
+            zone = "above_duct"
+            height_avail = z_up - d_top
+            z_center = d_top + height_avail / 2  # center in available space above duct
+        elif xc < duct_xc_min:
+            # Forward of duct
+            zone = "forward"
+            height_avail = z_up - z_lo
+            z_center = (z_up + z_lo) / 2
+        else:
+            # Aft of duct or no duct data
+            zone = "aft"
+            height_avail = z_up - z_lo
+            z_center = (z_up + z_lo) / 2
+
+        fits = H <= height_avail * 0.85 if H > 0 else True
+        clearance = (height_avail - H) / 2 if H > 0 else height_avail
 
         results.append({
             "name": c.name,
@@ -240,12 +311,13 @@ def compute_component_positions_3d(
             "bbox_mm": [
                 round(x_mm - L / 2, 1), round(x_mm + L / 2, 1),
                 round(-W / 2, 1), round(W / 2, 1),
-                round(z_center - half_h, 1), round(z_center + half_h, 1),
+                round(z_center - H / 2, 1), round(z_center + H / 2, 1),
             ],
             "envelope_mm": [round(z_lo, 1), round(z_up, 1)],
             "height_avail_mm": round(height_avail, 1),
             "fits": fits,
             "clearance_mm": round(clearance, 1),
+            "zone": zone,
         })
 
     return results
@@ -258,12 +330,12 @@ def print_placement_summary(
     """Print component placement summary with fit status."""
     positions = compute_component_positions_3d(params, avionics)
 
-    print(f"\n{'='*80}")
+    print(f"\n{'='*85}")
     print(f"  COMPONENT PLACEMENT (body chord = {params.body_root_chord*1000:.0f} mm)")
-    print(f"{'='*80}")
+    print(f"{'='*85}")
     print(f"  {'Component':<22s} {'x[mm]':>7s} {'z[mm]':>7s} {'H[mm]':>6s} "
-          f"{'Avail':>6s} {'Clr':>5s} {'Fit':>4s}")
-    print(f"  {'-'*60}")
+          f"{'Avail':>6s} {'Clr':>5s} {'Zone':<12s} {'Fit':>4s}")
+    print(f"  {'-'*70}")
 
     all_fit = True
     for p in positions:
@@ -277,8 +349,8 @@ def print_placement_summary(
             print(f"  {p['name']:<22s} {p['position_mm'][0]:7.1f} "
                   f"{p['position_mm'][2]:7.1f} {h:6.0f} "
                   f"{p['height_avail_mm']:6.0f} {p['clearance_mm']:5.0f} "
-                  f"{status:>4s}")
+                  f"{p.get('zone', '?'):<12s} {status:>4s}")
 
-    print(f"  {'-'*60}")
+    print(f"  {'-'*70}")
     print(f"  Overall: {'ALL FIT' if all_fit else 'SOME DO NOT FIT'}")
     print()

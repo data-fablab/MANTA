@@ -333,29 +333,28 @@ class DesignCatalog:
     # ── Batch STEP export ─────────────────────────────────────────────────
 
     def export_all_step(self, output_dir: str = "output/catalog",
-                         version: str = "v2",
+                         include_propulsion: bool = False,
                          n_profile: int = 100,
                          verbose: bool = True) -> dict[str, str]:
         """Export all designs as STEP files.
 
         Returns dict of {design_name: step_file_path}.
         """
-        from ..visualization.export import (
-            export_aircraft_step_v2,
-            export_aircraft_step_v3,
-        )
+        from ..visualization.export import export_aircraft_step
 
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         paths = {}
 
-        export_fn = export_aircraft_step_v2 if version == "v2" else export_aircraft_step_v3
-
         for entry in self.entries.values():
             step_path = str(out / f"{entry.name}.step")
             if verbose:
                 print(f"  Exporting {entry.name}...", end=" ", flush=True)
-            result = export_fn(entry.params, step_path, n_profile=n_profile)
+            result = export_aircraft_step(
+                entry.params, step_path,
+                n_profile=n_profile,
+                include_propulsion=include_propulsion,
+            )
             paths[entry.name] = step_path
             if verbose:
                 print(f"{result['file_size_kb']:.0f} KB, valid={result['is_valid']}")

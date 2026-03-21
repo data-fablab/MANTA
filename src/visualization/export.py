@@ -704,109 +704,7 @@ def _save_spline_csv(path, points: np.ndarray, name: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STEP export — true NURBS surfaces via CadQuery
-# ═══════════════════════════════════════════════════════════════════════════
-
-def export_aircraft_step(params: BWBParams, path: str,
-                         n_profile: int = 100,
-                         n_spanwise: int = 40,
-                         tolerance_mm: float = 0.005) -> str:
-    """Export BWB aircraft as a STEP file with a single smooth BSpline surface.
-
-    Builds a dense grid of points (n_profile x 2*n_spanwise-1), fits a single
-    BSpline surface through it via GeomAPI_PointsToBSplineSurface. The grid
-    is symmetric (left mirror + right), so the surface naturally has zero
-    cross-derivative at the symmetry plane — no seam, no crease.
-
-    Parameters
-    ----------
-    params : BWBParams
-    path : str
-        Output .step file path.
-    n_profile : int
-        Points per airfoil section (chordwise resolution). Default 200.
-    n_spanwise : int
-        Sections per half-span (densified via PCHIP). Default 40.
-    tolerance_mm : float
-        BSpline approximation tolerance in mm. Default 0.005.
-
-    Returns
-    -------
-    str
-        Path to the exported STEP file.
-    """
-    import cadquery as cq
-    from scipy.interpolate import PchipInterpolator
-    from OCP.TColgp import TColgp_Array2OfPnt
-    from OCP.gp import gp_Pnt
-    from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
-    from OCP.GeomAbs import GeomAbs_C2
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-
-    p = params
-
-    # Build defining sections: body (3) + wing (6), merged at blend = 8
-    body_sections = _build_body_sections(p, n_profile)
-    wing_sections = _build_wing_sections(p, n_profile)
-    all_sections = body_sections + wing_sections[1:]
-
-    # Spanwise positions (meters)
-    bw = p.body_halfwidth
-    hs = p.half_span
-    body_y = [f * bw for f in BODY_STATIONS]
-    wing_y = [bw + f * (hs - bw) for f in OUTER_WING_STATIONS]
-    all_y = np.array(body_y + wing_y[1:])
-
-    # Densify to n_spanwise sections per half via PCHIP interpolation
-    stack = np.array(all_sections)  # (8, n_profile, 3)
-    y_dense = np.linspace(0, all_y[-1], n_spanwise)
-
-    dense_sections = []
-    for k in range(n_spanwise):
-        sec = np.zeros((n_profile, 3))
-        for i in range(n_profile):
-            for ax in range(3):
-                pch = PchipInterpolator(all_y, stack[:, i, ax])
-                sec[i, ax] = pch(y_dense[k])
-        dense_sections.append(sec)
-
-    # Mirror for left side (exclude root to avoid duplicate)
-    left_sections = []
-    for sec in reversed(dense_sections[1:]):
-        m = sec.copy()
-        m[:, 1] = -m[:, 1]
-        left_sections.append(m)
-
-    # Full symmetric grid: left tip → root → right tip
-    full = left_sections + dense_sections
-    n_sec = len(full)
-
-    # Build OCC point grid (in mm)
-    grid = TColgp_Array2OfPnt(1, n_profile, 1, n_sec)
-    for j, sec in enumerate(full):
-        for i in range(n_profile):
-            grid.SetValue(i + 1, j + 1, gp_Pnt(
-                float(sec[i, 0] * 1000),
-                float(sec[i, 1] * 1000),
-                float(sec[i, 2] * 1000),
-            ))
-
-    # Fit single BSpline surface (C2, symmetric → zero dX/dV, dZ/dV at root)
-    approx = GeomAPI_PointsToBSplineSurface(
-        grid, 3, 8, GeomAbs_C2, tolerance_mm,
-    )
-    surf = approx.Surface()
-
-    # Create face and export
-    face = BRepBuilderAPI_MakeFace(surf, tolerance_mm).Face()
-    result = cq.Workplane("XY").add(cq.Shape(face))
-    cq.exporters.export(result, path, cq.exporters.ExportTypes.STEP)
-
-    return path
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP v2 export — watertight solid via BRepOffsetAPI_ThruSections loft
+# STEP export — watertight solid via BRepOffsetAPI_ThruSections loft
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _make_open_wire(pts_mm: np.ndarray, tol_mm: float = 1e-3):
@@ -976,55 +874,41 @@ def _densify_sections(
     return densified
 
 
-def export_aircraft_step_v2(params: BWBParams, path: str,
-                            n_profile: int = 100) -> dict:
-    """Export BWB aircraft as a watertight STEP solid via ThruSections loft.
-
-    Builds closed BSpline wires from each defining section, lofts them
-    with BRepOffsetAPI_ThruSections to produce a solid right half, mirrors
-    across XZ, fuses both halves, and exports to STEP with validation.
-
-    Parameters
-    ----------
-    params : BWBParams
-    path : str
-        Output .step file path.
-    n_profile : int
-        Points per airfoil section. Default 120.
+def _build_oml_solid(
+    params: BWBParams, n_profile: int = 100,
+) -> tuple['TopoDS_Shape', list, list]:
+    """Build the fused OML solid (right + left halves).
 
     Returns
     -------
-    dict
-        Validation metrics: path, file_size_kb, volume_mm3,
-        surface_area_mm2, is_valid, max_deviation_mm, n_sections.
+    oml_solid : TopoDS_Shape
+        Full aircraft OML solid (both halves fused).
+    all_sections : list of (n_profile, 3) arrays
+        The 9 defining sections before densification.
+    dense_sections : list of (n_profile, 3) arrays
+        All sections after densification (defining + intermediates).
     """
-    import os
     import warnings
-    import cadquery as cq
     from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
     from OCP.GeomAbs import GeomAbs_C2
     from OCP.Approx import Approx_ChordLength
     from OCP.gp import gp_Pnt, gp_Trsf, gp_Ax2, gp_Dir
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
-    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-    from OCP.BRepCheck import BRepCheck_Analyzer
-    from OCP.GProp import GProp_GProps
-    from OCP.BRepGProp import BRepGProp
     from .step_booleans import robust_fuse
 
     p = params
 
-    # ── 2a. Build defining sections ──
+    # Build defining sections
     body_sections = _build_body_sections(p, n_profile)
     wing_sections = _build_wing_sections(p, n_profile)
     all_sections = body_sections + wing_sections[1:]  # merge at blend
 
-    # ── 2b. Densify control zones with intermediate sections ──
+    # Densify with intermediate sections (flat TE in control zones)
     dense_sections = _densify_sections(p, all_sections, n_profile)
     wires = [_make_periodic_wire(sec) for sec in dense_sections]
 
-    # ── 2c. Single C2 loft (densified stations keep TE flat) ──
-    loft = BRepOffsetAPI_ThruSections(True, False)  # isSolid=True, ruled=False
+    # C2 loft
+    loft = BRepOffsetAPI_ThruSections(True, False)
     loft.SetMaxDegree(6)
     loft.SetContinuity(GeomAbs_C2)
     loft.SetParType(Approx_ChordLength)
@@ -1036,17 +920,17 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
         raise RuntimeError("BRepOffsetAPI_ThruSections loft failed")
     right_solid = loft.Shape()
 
-    # ── 2d. Mirror across XZ plane (negate Y) ──
+    # Mirror across XZ plane
     trsf = gp_Trsf()
     trsf.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)))
     left_solid = BRepBuilderAPI_Transform(right_solid, trsf, True).Shape()
 
-    # ── 2e. Fuse both halves (robust pipeline) ──
+    # Fuse both halves (robust pipeline with sewing fallback)
     fused_result, fuse_msg = robust_fuse(
-        right_solid, left_solid, label="v2-halves",
+        right_solid, left_solid, label="oml-halves",
     )
     if fused_result is not None:
-        full_solid = fused_result
+        oml_solid = fused_result
     else:
         warnings.warn("Robust fuse failed (%s), falling back to sewing" % fuse_msg)
         from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
@@ -1057,13 +941,64 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
         sew.Add(left_solid)
         sew.Perform()
         sewn = sew.SewedShape()
-        full_solid = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn)).Solid()
+        oml_solid = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn)).Solid()
 
-    # ── 2f. Validate topology ──
+    return oml_solid, all_sections, dense_sections
+
+
+def export_aircraft_step(
+    params: BWBParams,
+    path: str,
+    n_profile: int = 100,
+    include_propulsion: bool = False,
+    edf: 'EDFSpec | None' = None,
+) -> dict:
+    """Export BWB aircraft as a watertight STEP solid.
+
+    Builds the OML via densified C2 ThruSections loft, mirrors and fuses
+    both halves.  Optionally integrates propulsion (duct, shell, boolean
+    cuts, hinge wires, IGES control surfaces).
+
+    Parameters
+    ----------
+    params : BWBParams
+    path : str
+        Output .step file path.
+    n_profile : int
+        Points per airfoil section. Default 100.
+    include_propulsion : bool
+        If True, add propulsion duct geometry with boolean integration.
+    edf : EDFSpec or None
+        EDF specification. Defaults to EDF_70MM.
+
+    Returns
+    -------
+    dict
+        Validation metrics.
+    """
+    if include_propulsion:
+        return _export_with_propulsion(params, path, n_profile, edf)
+    return _export_oml_only(params, path, n_profile)
+
+
+def _export_oml_only(params: BWBParams, path: str,
+                     n_profile: int = 100) -> dict:
+    """Export OML-only STEP solid with validation."""
+    import os
+    import warnings
+    import cadquery as cq
+    from OCP.gp import gp_Pnt
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+
+    full_solid, all_sections, dense_sections = _build_oml_solid(params, n_profile)
+
+    # Validate topology
     analyzer = BRepCheck_Analyzer(full_solid)
     is_valid = analyzer.IsValid()
 
-    # ── 2g. Compute volume and surface area ──
+    # Volume and surface area
     vol_props = GProp_GProps()
     BRepGProp.VolumeProperties_s(full_solid, vol_props)
     volume_mm3 = abs(vol_props.Mass())
@@ -1072,7 +1007,7 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
     BRepGProp.SurfaceProperties_s(full_solid, area_props)
     surface_area_mm2 = area_props.Mass()
 
-    # ── 2h. Max deviation at control points ──
+    # Max deviation at control points
     max_dev = 0.0
     try:
         from OCP.BRepExtrema import BRepExtrema_DistShapeShape
@@ -1084,17 +1019,16 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
                 vertex = BRepBuilderAPI_MakeVertex(
                     gp_Pnt(float(pt_mm[0]), float(pt_mm[1]), float(pt_mm[2]))
                 ).Vertex()
-                dist_calc = BRepExtrema_DistShapeShape(vertex, right_solid)
+                dist_calc = BRepExtrema_DistShapeShape(vertex, full_solid)
                 if dist_calc.IsDone() and dist_calc.NbSolution() > 0:
                     max_dev = max(max_dev, dist_calc.Value())
     except Exception:
-        max_dev = -1.0  # deviation check failed, non-critical
+        max_dev = -1.0
 
-    # ── 2i. Export to STEP ──
+    # Export
     result_shape = cq.Workplane("XY").add(cq.Shape(full_solid))
     cq.exporters.export(result_shape, path, cq.exporters.ExportTypes.STEP)
 
-    # ── 2j. Verify file size ──
     file_size_kb = os.path.getsize(path) / 1024
     if file_size_kb < 426:
         warnings.warn(
@@ -1111,7 +1045,6 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
         "max_deviation_mm": round(max_dev, 4),
         "n_sections_defining": len(all_sections),
         "n_sections_dense": len(dense_sections),
-        "loft_mode": "densified",
     }
 
 
@@ -1175,119 +1108,23 @@ def _loft_duct_solid(sections_3d: list[np.ndarray]) -> 'TopoDS_Shape':
     return loft.Shape()
 
 
-def _make_cutting_box(center_mm, half_sizes_mm):
-    """Create an axis-aligned box for boolean cutting.
-
-    Parameters: center_mm=[cx,cy,cz], half_sizes_mm=[hx,hy,hz] in mm.
-    """
-    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
-    from OCP.gp import gp_Pnt
-    cx, cy, cz = center_mm
-    hx, hy, hz = half_sizes_mm
-    return BRepPrimAPI_MakeBox(
-        gp_Pnt(cx - hx, cy - hy, cz - hz),
-        gp_Pnt(cx + hx, cy + hy, cz + hz),
-    ).Shape()
-
-
-def _make_cutting_prism(cross_section_mm, center_mm, extrude_mm=100.0):
-    """Create a cutting tool by extruding a 2D cross-section through the skin.
-
-    Builds a BRep face from a closed superellipse/ellipse cross-section,
-    then extrudes it along the Z-axis (both up and down) to fully
-    penetrate the OML skin.
-
-    Parameters
-    ----------
-    cross_section_mm : (n, 2) array
-        Closed cross-section [y, z_local] in mm (local frame).
-    center_mm : [cx, cy, cz]
-        3D center position in mm.
-    extrude_mm : float
-        Half-extrusion distance above and below center (default 100mm
-        ensures full skin penetration).
-
-    Returns
-    -------
-    TopoDS_Shape — solid prism for boolean cutting.
-    """
-    from OCP.gp import gp_Pnt, gp_Vec
-    from OCP.TColgp import TColgp_HArray1OfPnt
-    from OCP.GeomAPI import GeomAPI_Interpolate
-    from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge,
-                                     BRepBuilderAPI_MakeWire,
-                                     BRepBuilderAPI_MakeFace)
-    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
-
-    cx, cy, cz = center_mm
-    cs = np.asarray(cross_section_mm)
-    n = len(cs)
-
-    # Build a closed wire in the YZ plane at x=cx
-    harray = TColgp_HArray1OfPnt(1, n)
-    for i in range(n):
-        harray.SetValue(i + 1, gp_Pnt(cx, cy + float(cs[i, 0]),
-                                        cz + float(cs[i, 1])))
-
-    interp = GeomAPI_Interpolate(harray, True, 1e-3)  # periodic=True
-    interp.Perform()
-    if not interp.IsDone():
-        raise RuntimeError("Cutting prism: BSpline interpolation failed")
-
-    curve = interp.Curve()
-    edge = BRepBuilderAPI_MakeEdge(curve).Edge()
-    wire = BRepBuilderAPI_MakeWire(edge).Wire()
-    face = BRepBuilderAPI_MakeFace(wire, True).Face()  # planar face
-
-    # Extrude along X-axis (chordwise) both directions
-    prism = BRepPrimAPI_MakePrism(face, gp_Vec(extrude_mm, 0, 0))
-    prism.Build()
-    if not prism.IsDone():
-        raise RuntimeError("Cutting prism: extrusion failed")
-
-    # Move prism so it's centered on cx (extrusion starts at face)
-    from OCP.gp import gp_Trsf
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
-    trsf = gp_Trsf()
-    trsf.SetTranslation(gp_Vec(-extrude_mm / 2, 0, 0))
-    return BRepBuilderAPI_Transform(prism.Shape(), trsf, True).Shape()
-
-
-def export_aircraft_step_v3(params: BWBParams, path: str,
-                             n_profile: int = 100,
-                             edf: 'EDFSpec | None' = None) -> dict:
-    """Export BWB aircraft with integrated propulsion as STEP compound.
-
-    Strategy:
-    1. Build OML solid via the exact v2 pipeline (periodic BSpline wires,
-       ThruSections C2 loft, mirror+fuse) -- proven quality.
-    2. Cut targeted openings in the OML using box cutting tools:
-       - Intake opening box (on upper surface)
-       - Exhaust slot box (at trailing edge)
-    3. Build the internal duct solid at its actual position.
-    4. Export as STEP compound: cut OML + duct channel.
-
-    Outputs 3 STEP files:
-    - {path}:                  compound (cut airframe + duct)
-    - {path}_oml_only.step:    OML without cuts (v2 quality reference)
-    - {path}_duct_only.step:   internal duct solid only
-    """
+def _export_with_propulsion(params: BWBParams, path: str,
+                            n_profile: int = 100,
+                            edf: 'EDFSpec | None' = None) -> dict:
+    """Export BWB aircraft with integrated propulsion as STEP compound."""
     import os
     import warnings
     import cadquery as cq
-    from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
-    from OCP.GeomAbs import GeomAbs_C2
-    from OCP.Approx import Approx_ChordLength
     from OCP.gp import gp_Pnt, gp_Trsf, gp_Ax2, gp_Dir
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
-    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
     from OCP.BRepCheck import BRepCheck_Analyzer
     from OCP.GProp import GProp_GProps
     from OCP.BRepGProp import BRepGProp
     from OCP.TopoDS import TopoDS_Compound
     from OCP.BRep import BRep_Builder
 
-    from .step_booleans import robust_fuse_and_cut, compute_volume, is_valid_solid
+    from .step_booleans import robust_fuse_and_cut
 
     from ..propulsion.duct_geometry import (
         compute_duct_placement, validate_duct_clearance,
@@ -1300,41 +1137,10 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     p = params
 
     # ==================================================================
-    # Step 1: OML solid -- exact v2 pipeline
+    # Step 1: OML solid
     # ==================================================================
-    print("[v3] 1/6  Building OML solid (v2 pipeline)...")
-
-    body_sections = _build_body_sections(p, n_profile)
-    wing_sections = _build_wing_sections(p, n_profile)
-    all_sections = body_sections + wing_sections[1:]
-
-    dense_sections = _densify_sections(p, all_sections, n_profile)
-    wires = [_make_periodic_wire(sec) for sec in dense_sections]
-
-    # Single C2 loft (densified stations keep TE flat)
-    loft = BRepOffsetAPI_ThruSections(True, False)
-    loft.SetMaxDegree(6)
-    loft.SetContinuity(GeomAbs_C2)
-    loft.SetParType(Approx_ChordLength)
-    loft.CheckCompatibility(True)
-    for w in wires:
-        loft.AddWire(w)
-    loft.Build()
-    if not loft.IsDone():
-        raise RuntimeError("OML loft failed")
-    right_solid = loft.Shape()
-
-    trsf = gp_Trsf()
-    trsf.SetMirror(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)))
-    left_solid = BRepBuilderAPI_Transform(right_solid, trsf, True).Shape()
-
-    fuse_op = BRepAlgoAPI_Fuse(right_solid, left_solid)
-    fuse_op.Build()
-    if fuse_op.IsDone():
-        oml_solid = fuse_op.Shape()
-    else:
-        warnings.warn("Mirror fuse failed -- using right half only")
-        oml_solid = right_solid
+    print("[prop] 1/6  Building OML solid...")
+    oml_solid, all_sections, dense_sections = _build_oml_solid(p, n_profile)
 
     oml_path = path.replace('.step', '_oml_only.step')
     cq.exporters.export(
@@ -1346,18 +1152,18 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     vol_oml = GProp_GProps()
     BRepGProp.VolumeProperties_s(oml_solid, vol_oml)
     oml_volume = abs(vol_oml.Mass())
-    print("[v3]      OML OK  (%.0f KB, %.1f cm3)" % (oml_kb, oml_volume / 1e6))
+    print("[prop]      OML OK  (%.0f KB, %.1f cm3)" % (oml_kb, oml_volume / 1e6))
 
     # ==================================================================
     # Step 2: Duct placement
     # ==================================================================
-    print("[v3] 2/6  Computing duct placement...")
+    print("[prop] 2/6  Computing duct placement...")
     placement = compute_duct_placement(p, prop_edf)
 
     # ==================================================================
     # Step 3: Internal duct solid (at actual position, no extensions)
     # ==================================================================
-    print("[v3] 3/6  Building internal duct solid...")
+    print("[prop] 3/6  Building internal duct solid...")
     n_duct_profile = 48
 
     import numpy as _np
@@ -1408,14 +1214,14 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
             duct_path, cq.exporters.ExportTypes.STEP,
         )
         duct_kb = os.path.getsize(duct_path) / 1024
-        print("[v3]      Duct OK (%d sections, %.0f KB)" % (len(all_duct_secs), duct_kb))
+        print("[prop]      Duct OK (%d sections, %.0f KB)" % (len(all_duct_secs), duct_kb))
     except Exception as e:
         warnings.warn("Duct loft failed: %s" % e)
 
     # ==================================================================
     # Step 4: Clearance validation
     # ==================================================================
-    print("[v3] 4/6  Validating duct clearance...")
+    print("[prop] 4/6  Validating duct clearance...")
     clr_ok, clr_results = validate_duct_clearance(placement, p)
     if not clr_ok:
         violations = [r for r in clr_results if not r.is_ok]
@@ -1427,7 +1233,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     else:
         min_top = min(r.clearance_top_mm for r in clr_results)
         min_bot = min(r.clearance_bot_mm for r in clr_results)
-        print("[v3]      Clearance OK (min top=%.1fmm, min bot=%.1fmm)" % (min_top, min_bot))
+        print("[prop]      Clearance OK (min top=%.1fmm, min bot=%.1fmm)" % (min_top, min_bot))
 
     # ==================================================================
     # Step 5: Build duct shell (coque) = duct sections + skin
@@ -1435,7 +1241,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     # The shell uses the EXACT same 3D sections as the duct solid,
     # but each section is dilated outward from its centroid by skin_mm.
     # This guarantees the shell perfectly wraps the duct.
-    print("[v3] 5/6  Building duct shell (coque)...")
+    print("[prop] 5/6  Building duct shell (coque)...")
     shell_solid = None
     skin_mm = 3.0
 
@@ -1462,7 +1268,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
             shell_path, cq.exporters.ExportTypes.STEP,
         )
         shell_kb = os.path.getsize(shell_path) / 1024
-        print("[v3]      Shell OK (vol=%.1f cm3, %.0f KB)" % (
+        print("[prop]      Shell OK (vol=%.1f cm3, %.0f KB)" % (
             abs(vol_s.Mass()) / 1e6, shell_kb))
     except Exception as e:
         warnings.warn("Shell build failed: %s" % e)
@@ -1472,7 +1278,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     # ==================================================================
     # Uses step_booleans.py: heal → unify → CellsBuilder → validate
     # with cascading fallbacks (CellsBuilder → Standard → Splitter).
-    print("[v3] 6/6  Boolean: robust Fuse(OML, Shell) + Cut(Duct)...")
+    print("[prop] 6/6  Boolean: robust Fuse(OML, Shell) + Cut(Duct)...")
     result_solid = oml_solid
     bool_ok = False
     bool_method = "none"
@@ -1487,7 +1293,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
                 result_solid = integrated
                 bool_ok = True
                 bool_method = status
-                print("[v3]      Boolean OK: %s" % status)
+                print("[prop]      Boolean OK: %s" % status)
             else:
                 warnings.warn("Boolean pipeline failed: %s — exporting multi-body fallback" % status)
         except Exception as e:
@@ -1526,7 +1332,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
                 wire_l = BRepBuilderAPI_Transform(wire_r, trsf_y, True).Shape()
                 builder.Add(compound, wire_l)
                 n_hinge_wires += 2
-        print("[v3]      Added %d hinge wires (%d control surfaces × 2 sides)" %
+        print("[prop]      Added %d hinge wires (%d control surfaces × 2 sides)" %
               (n_hinge_wires, len(geoms)))
     except Exception as e:
         warnings.warn("Could not add hinge wires: %s" % e)
@@ -1598,7 +1404,7 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
         iges_writer.ComputeModel()
         iges_writer.Write(hinge_path)
         hinge_kb = os.path.getsize(hinge_path) / 1024
-        print("[v3]      Control surfaces: %.0f KB -> %s" % (hinge_kb, hinge_path))
+        print("[prop]      Control surfaces: %.0f KB -> %s" % (hinge_kb, hinge_path))
 
     result = {
         "path": path,
@@ -1616,14 +1422,13 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
         "duct_size_kb": round(duct_kb, 1),
         "hinge_path": hinge_path,
         "hinge_size_kb": round(hinge_kb, 1),
-        "n_oml_sections_defining": len(all_sections),
-        "n_oml_sections_dense": len(dense_sections),
+        "n_sections_defining": len(all_sections),
+        "n_sections_dense": len(dense_sections),
         "n_duct_sections": len(all_duct_secs),
         "n_hinge_wires": n_hinge_wires,
-        "loft_mode": "densified",
     }
 
-    print("[v3] Done: %.0f KB, valid=%s, boolean=%s, vol=%.1f cm3, hinge_wires=%d" % (
+    print("[prop] Done: %.0f KB, valid=%s, boolean=%s, vol=%.1f cm3, hinge_wires=%d" % (
         file_size_kb, is_valid, bool_ok, volume_mm3 / 1e6, n_hinge_wires))
 
     return result

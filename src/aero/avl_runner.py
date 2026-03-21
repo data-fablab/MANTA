@@ -17,6 +17,8 @@ from typing import Optional
 import numpy as np
 import aerosandbox as asb
 
+from ..constants import G
+
 
 # Default AVL executable path
 _DEFAULT_AVL_CMD = "d:/UAV/tools/avl/avl.exe"
@@ -120,6 +122,7 @@ def run_avl_stability(
     chordwise_res: int = 6,
     spanwise_res: int = 8,
     controls: ControlConfig | None = None,
+    trim: bool = True,
 ) -> Optional[dict]:
     """Run AVL at given alpha and return stability + control derivatives.
 
@@ -168,14 +171,14 @@ def run_avl_stability(
             f"mn 0.0\n"          # Mach
             f"v {velocity}\n"    # velocity
             f"d {density}\n"     # density
-            f"g 9.81\n"          # gravity
+            f"g {G}\n"           # gravity
             f"\n"                # back to OPER
             f"a a {alpha}\n"     # set alpha
             f"b b 0.0\n"         # beta = 0
         )
 
         # Add trim constraint: elevon trims pitch moment to 0
-        if controls and controls.trim_elevon and controls.surfaces:
+        if trim and controls and controls.trim_elevon and controls.surfaces:
             keystrokes += f"d1 pm 0\n"   # control 1 → trim Cm=0
 
         keystrokes += (

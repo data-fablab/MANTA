@@ -48,7 +48,7 @@ def compute_longitudinal_modes(
     mass : float — Aircraft mass [kg]
     Iy : float, optional — Pitch moment of inertia [kg.m2]. Estimated if None.
     """
-    g = 9.81
+    from ..constants import G
     q_bar = 0.5 * rho * velocity**2
     u0 = velocity
 
@@ -71,7 +71,7 @@ def compute_longitudinal_modes(
     # 4x4 state matrix [u, alpha, q, theta]
     # Simplified (neglect X_a, M_u terms for clarity)
     A = np.array([
-        [X_u,       0,       0, -g],
+        [X_u,       0,       0, -G],
         [Z_u / u0,  Z_a / u0, 1 + Z_q / u0, 0],
         [0,         M_a,     M_q, 0],
         [0,         0,       1,   0],
@@ -102,7 +102,7 @@ def compute_lateral_modes(
     mass : float — Aircraft mass [kg]
     Ix, Iz : float, optional — Roll/yaw inertias [kg.m2]. Estimated if None.
     """
-    g = 9.81
+    from ..constants import G
     q_bar = 0.5 * rho * velocity**2
     u0 = velocity
 
@@ -127,7 +127,7 @@ def compute_lateral_modes(
 
     # 4x4 state matrix [beta, p, r, phi]
     A = np.array([
-        [Y_b / u0,   0,       -(1 - Y_r / u0), g / u0],
+        [Y_b / u0,   0,       -(1 - Y_r / u0), G / u0],
         [L_b,        L_p,     L_r,              0],
         [N_b,        N_p,     N_r,              0],
         [0,          1,       0,                0],

@@ -12,6 +12,7 @@ if matplotlib.get_backend().lower() in ("agg", ""):
     except NameError:
         matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from .style import COLORS, FONT_SIZES, clean_spines, save_fig
 from ..parameterization.design_variables import BWBParams
 from ..parameterization.bwb_aircraft import (
     build_kulfan_airfoil_at_station,
@@ -63,8 +64,9 @@ def plot_planform(params: BWBParams, ax=None, save_path: str | None = None):
 
     wing_chords = [p.wing_root_chord + frac * (tip_chord - p.wing_root_chord)
                    for frac in OUTER_WING_STATIONS]
-    wing_twists = [0.0, p.twist_1, p.twist_2, p.twist_3, p.twist_4, p.twist_tip]
-    wing_dihedrals = [p.dihedral_0, p.dihedral_1, p.dihedral_2, p.dihedral_3, p.dihedral_tip]
+    from ..parameterization.bwb_aircraft import outer_wing_twists, outer_wing_dihedrals
+    wing_twists = outer_wing_twists(p)
+    wing_dihedrals = outer_wing_dihedrals(p)
 
     # 3-D positions along outer wing
     wing_positions = [[x_blend, bw, 0.0]]
@@ -79,8 +81,8 @@ def plot_planform(params: BWBParams, ax=None, save_path: str | None = None):
 
     # ────────────────────────── TOP VIEW ──────────────────────────
     ax_top = axes[0]
-    body_color = "darkorange"
-    wing_color = "steelblue"
+    body_color = COLORS["body"]
+    wing_color = COLORS["wing"]
 
     for sign in [1, -1]:
         # Center body
@@ -138,7 +140,7 @@ def plot_planform(params: BWBParams, ax=None, save_path: str | None = None):
     ax_top.set_title(f"Top View — span={2*p.half_span:.2f}m, "
                      f"S={area:.3f}m\u00b2, AR={ar:.1f}")
     ax_top.set_aspect("equal")
-    ax_top.legend(fontsize=8)
+    ax_top.legend(fontsize=FONT_SIZES["legend"])
     ax_top.grid(True, alpha=0.2)
     ax_top.invert_yaxis()
 
@@ -167,13 +169,13 @@ def plot_planform(params: BWBParams, ax=None, save_path: str | None = None):
                        f"{p.dihedral_1:.0f}\u00b0, {p.dihedral_2:.0f}\u00b0, "
                        f"{p.dihedral_3:.0f}\u00b0, {p.dihedral_tip:.0f}\u00b0]")
     ax_front.set_aspect("equal")
-    ax_front.legend(fontsize=8)
+    ax_front.legend(fontsize=FONT_SIZES["legend"])
     ax_front.grid(True, alpha=0.3)
 
     if show:
         plt.tight_layout()
         if save_path:
-            fig.savefig(save_path, dpi=150)
+            save_fig(fig, save_path)
         plt.close(fig)
     return fig
 
@@ -245,7 +247,7 @@ def plot_airfoils(params: BWBParams, save_path: str | None = None):
 
     plt.tight_layout()
     if save_path:
-        fig.savefig(save_path, dpi=150)
+        save_fig(fig, save_path)
     plt.close(fig)
     return fig
 
@@ -311,7 +313,7 @@ def plot_convergence(history: list[dict], save_path: str | None = None,
 
     plt.tight_layout()
     if save_path:
-        fig.savefig(save_path, dpi=150)
+        save_fig(fig, save_path)
     plt.close(fig)
     return fig
 
@@ -366,7 +368,7 @@ def plot_surrogate_convergence(cycle_history: list[dict],
 
     plt.tight_layout()
     if save_path:
-        fig.savefig(save_path, dpi=150)
+        save_fig(fig, save_path)
     plt.close(fig)
     return fig
 
@@ -438,6 +440,6 @@ def plot_propulsion_balance(result: dict, save_path: str | None = None):
 
     plt.tight_layout()
     if save_path:
-        fig.savefig(save_path, dpi=150)
+        save_fig(fig, save_path)
     plt.close(fig)
     return fig

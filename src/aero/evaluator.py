@@ -26,26 +26,38 @@ from ..propulsion.edf_model import (
 from ..systems.cg import compute_cg, CGConfig, DEFAULT_CG_CONFIG
 from ..evaluation.manufacturability import compute_manufacturability
 
-_DEFAULT_AVL_CMD = "d:/UAV/tools/avl/avl.exe"
-
-
 class AeroEvaluator:
     """Evaluate BWB aircraft aerodynamics via AVL + NeuralFoil."""
 
     def __init__(self, mission: MissionCondition | None = None,
                  feasibility: FeasibilityConfig | None = None,
                  use_neuralfoil: bool = True,
-                 avl_command: str = _DEFAULT_AVL_CMD,
+                 avl_command: str | None = None,
                  controls: ControlConfig | None = None,
                  cg_config: CGConfig | None = None,
-                 use_cg: bool = True):
+                 use_cg: bool = True,
+                 aero_model=None,
+                 structure_config=None,
+                 **kwargs):
         self.mission = mission or MissionCondition()
         self.feasibility = feasibility or DEFAULT_FEASIBILITY
         self.use_neuralfoil = use_neuralfoil
+        from ..config import load_config
+        if avl_command is None:
+            _cfg = load_config()
+            avl_command = _cfg.get("avl", {}).get("command", "avl")
+        else:
+            _cfg = load_config()
         self.avl_command = avl_command
+        avl_cfg = _cfg.get("avl", {})
+        self.avl_spanwise_res = avl_cfg.get("spanwise_res", 20)
+        self.avl_chordwise_res = avl_cfg.get("chordwise_res", 6)
+        self.avl_timeout = avl_cfg.get("timeout", 10.0)
         self.controls = controls or ControlConfig.default_bwb()
         self.cg_config = cg_config or DEFAULT_CG_CONFIG
         self.use_cg = use_cg
+        self.aero_model = aero_model
+        self.structure_config = structure_config
 
     def evaluate(self, params: BWBParams) -> dict:
         """Full aero + stability + propulsion + control evaluation.
@@ -69,6 +81,7 @@ class AeroEvaluator:
                 edf_mass=mission.motor_mass,
                 avionics_mass=mission.avionics_mass,
                 config=self.cg_config,
+                structure_config=self.structure_config,
             )
             x_cg = cg_result["x_cg"]
 
@@ -87,10 +100,14 @@ class AeroEvaluator:
 
         try:
             # AVL at alpha=0: get CL_0, CM_0 + all stability derivatives
+            # trim=False: we want untrimmed CM_0 for the surrogate
             avl0 = run_avl_stability(
                 airplane, alpha=0.0, velocity=mission.velocity,
                 avl_command=self.avl_command,
-                controls=self.controls,
+                controls=self.controls, trim=False,
+                spanwise_res=self.avl_spanwise_res,
+                chordwise_res=self.avl_chordwise_res,
+                timeout=self.avl_timeout,
             )
             if avl0 is None:
                 raise RuntimeError("AVL failed at alpha=0")
@@ -114,13 +131,18 @@ class AeroEvaluator:
                 alpha_eq = np.degrees((cl_required - cl_0) / cl_alpha)
             else:
                 alpha_eq = 5.0
-            alpha_eq = float(np.clip(alpha_eq, -2, 12))
+            from ..config import AeroModelConfig
+            _ac = self.aero_model or AeroModelConfig()
+            alpha_eq = float(np.clip(alpha_eq, _ac.alpha_trim_clip_min, _ac.alpha_trim_clip_max))
 
             # AVL at trim alpha: with elevon trim (CM→0)
             avl_t = run_avl_stability(
                 airplane, alpha=alpha_eq, velocity=mission.velocity,
                 avl_command=self.avl_command,
                 controls=self.controls,
+                spanwise_res=self.avl_spanwise_res,
+                chordwise_res=self.avl_chordwise_res,
+                timeout=self.avl_timeout,
             )
             if avl_t is None:
                 raise RuntimeError("AVL failed at trim alpha")
@@ -155,14 +177,16 @@ class AeroEvaluator:
 
         if self.use_neuralfoil:
             cd0_wing = compute_wing_cd0(params, alpha_eq, mission.velocity,
-                                        mission.kinematic_viscosity)
+                                        mission.kinematic_viscosity,
+                                        config=self.aero_model)
         else:
             from .drag import estimate_parasite_drag
             cd0_wing = estimate_parasite_drag(params, mission.velocity,
                                               mission.kinematic_viscosity) * 0.7
 
         cd0_body = compute_body_cd0(params, alpha_eq, mission.velocity,
-                                     mission.kinematic_viscosity, s_ref, cd_intake)
+                                     mission.kinematic_viscosity, s_ref, cd_intake,
+                                     config=self.aero_model)
 
         cd0 = cd0_wing + cd0_body
         e = oswald_efficiency(ar, params.le_sweep_deg, params.taper_ratio)
@@ -182,7 +206,8 @@ class AeroEvaluator:
         cd_effective = cd * self.feasibility.drag_margin
 
         # ── Structural + volume ──
-        struct_mass = estimate_structural_mass(params, mtow=mission.mtow)
+        struct_mass = estimate_structural_mass(params, mtow=mission.mtow,
+                                                structure_config=self.structure_config)
         internal_volume = compute_internal_volume(params)
         static_margin = -cm_alpha / cl_alpha if abs(cl_alpha) > 0.01 else 0.0
 

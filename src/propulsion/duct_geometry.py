@@ -61,20 +61,21 @@ class DuctPlacement:
     body_chord: float             # [m] body root chord (reference)
 
 
-def compute_duct_placement(params: BWBParams, edf: EDFSpec) -> DuctPlacement:
+def compute_duct_placement(params: BWBParams, edf: EDFSpec,
+                           config=None) -> DuctPlacement:
     """Derive duct placement from aircraft geometry and EDF specs.
 
     Automatically positions the intake, fan, and exhaust to fit within
     the BWB center body while maintaining aerodynamic constraints.
     """
+    from ..config import DuctGeometryConfig
+    if config is None:
+        config = DuctGeometryConfig()
     body_chord = params.body_root_chord
     body_tc = params.body_tc_root
 
     # ── Intake placement ──
-    # Dorsal lip intake very close to the leading edge (nEUROn-style).
-    # Shallow ramp (25mm depth, 50mm length) to maximise S-duct length
-    # and keep offset/L < 0.45 for good pressure recovery.
-    intake_x_frac = 0.04
+    intake_x_frac = config.intake_x_frac
     intake_x = intake_x_frac * body_chord
 
     # Upper surface z at intake location (from body airfoil)
@@ -87,14 +88,14 @@ def compute_duct_placement(params: BWBParams, edf: EDFSpec) -> DuctPlacement:
     # Wider and shallower than a classic NACA scoop — the D-shape
     # transitions smoothly from the flat upper surface into the S-duct.
     # Width = 1.8 × fan diameter, depth ≈ 0.5 × fan_dia, length = 3 × depth.
-    intake_width = edf.fan_diameter * 1.8     # wider for D-shape
-    intake_depth = edf.fan_diameter * 0.5     # ~35mm for 70mm EDF
-    intake_length = intake_depth * 3.0        # longer ramp for smooth transition
+    intake_width = edf.fan_diameter * config.intake_width_factor
+    intake_depth = edf.fan_diameter * config.intake_depth_factor
+    intake_length = intake_depth * config.intake_ramp_factor
 
     # ── Fan face placement ──
     # Fan at 40% chord — thick part of the body, centered on the camber
     # line so the duct stays entirely within the body envelope.
-    fan_x_frac = 0.40
+    fan_x_frac = config.fan_x_frac
     fan_x = fan_x_frac * body_chord
 
     z_upper_fan, z_camber_fan, _ = _body_surface_z(fan_x_frac, body_tc,
@@ -107,7 +108,7 @@ def compute_duct_placement(params: BWBParams, edf: EDFSpec) -> DuctPlacement:
     # ── Exhaust placement ──
     # Flat slot near trailing edge (x/c=0.93) where 27mm of thickness
     # is available for the convergent nozzle exit.
-    exhaust_x_frac = 0.93
+    exhaust_x_frac = config.exhaust_x_frac
     exhaust_x = exhaust_x_frac * body_chord
 
     z_upper_ex, z_camber_ex, _ = _body_surface_z(exhaust_x_frac, body_tc,
@@ -118,15 +119,15 @@ def compute_duct_placement(params: BWBParams, edf: EDFSpec) -> DuctPlacement:
 
     # Exhaust slot: flatten to wide, low-profile slot for stealth
     fan_area = np.pi / 4 * edf.fan_diameter ** 2
-    nozzle_area_ratio = 0.80  # convergent nozzle
+    nozzle_area_ratio = config.nozzle_area_ratio
     exit_area = fan_area * nozzle_area_ratio
     # Aspect ratio ~3:1 for flat exhaust
     exhaust_width = np.sqrt(exit_area * 3.0)
     exhaust_height = exit_area / exhaust_width
 
     # ── Duct dimensions ──
-    duct_wall = 0.001  # 1mm wall (carbon prepreg or 3D print LW-PLA)
-    housing_length = edf.fan_diameter * 1.5  # motor + fan assembly length
+    duct_wall = config.duct_wall_mm / 1000.0
+    housing_length = edf.fan_diameter * config.housing_length_factor
 
     return DuctPlacement(
         intake_x_frac=intake_x_frac,
@@ -154,6 +155,7 @@ def compute_duct_placement(params: BWBParams, edf: EDFSpec) -> DuctPlacement:
 def compute_duct_structure_mass(
     placement: DuctPlacement,
     material_density: float = 1500.0,
+    config=None,
 ) -> float:
     """Estimate mass of the duct wall structure (carbon composite).
 
@@ -171,6 +173,11 @@ def compute_duct_structure_mass(
     -------
     float : duct structure mass [kg] (wall + 30% mounting hardware).
     """
+    from ..config import DuctGeometryConfig
+    if config is None:
+        config = DuctGeometryConfig()
+    if material_density == 1500.0:
+        material_density = config.material_density
     centerline = compute_duct_centerline(placement, n_pts=40)
     wall_t = placement.duct_wall_thickness  # [m]
 
@@ -196,7 +203,7 @@ def compute_duct_structure_mass(
         wall_volume += perimeter * wall_t * dx
 
     wall_mass = wall_volume * material_density
-    return wall_mass * 1.30  # +30% for flanges, pylons, firewall
+    return wall_mass * config.structural_adder
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -8,6 +8,7 @@ sections (t/c > 15%) where 2D strip theory is inaccurate.
 import numpy as np
 import aerosandbox as asb
 from ..parameterization.design_variables import BWBParams
+from ..parameterization.bwb_aircraft import outer_wing_twists
 from ..parameterization.bwb_aircraft import (
     build_kulfan_airfoil_at_station,
     OUTER_WING_STATIONS, N_OUTER_SEGMENTS,
@@ -24,17 +25,20 @@ def oswald_efficiency(ar: float, sweep_deg: float, taper: float) -> float:
 
 def compute_wing_cd0(
     params: BWBParams, alpha_eq: float, velocity: float, kinematic_viscosity: float,
+    config=None,
 ) -> float:
     """Viscous drag CD0 of the outer wing via NeuralFoil strip integration.
 
     Only applies to the outer wing where t/c < 15% and NeuralFoil is reliable.
     """
+    from ..config import AeroModelConfig
+    if config is None:
+        config = AeroModelConfig()
     p = params
     outer_span = p.outer_half_span
     root_chord = p.wing_root_chord
     tip_chord = p.tip_chord
-    twist_055 = p.twist_2 + (0.55 - 0.50) / (0.75 - 0.50) * (p.twist_3 - p.twist_2)
-    twists = [0.0, p.twist_1, p.twist_2, twist_055, p.twist_3, p.twist_4, p.twist_tip]
+    twists = outer_wing_twists(p)
 
     s_ref = _compute_outer_wing_area(p)
     cd_total = 0.0
@@ -48,15 +52,15 @@ def compute_wing_cd0(
         twist_local = (twists[i] + twists[i + 1]) / 2
 
         re_local = velocity * chord_local / kinematic_viscosity
-        re_local = np.clip(re_local, 5e4, 5e5)
-        alpha_local = np.clip(alpha_eq + twist_local, -5.0, 15.0)
+        re_local = np.clip(re_local, config.re_clip_min, config.re_clip_max)
+        alpha_local = np.clip(alpha_eq + twist_local, config.alpha_clip_min, config.alpha_clip_max)
 
         try:
             kaf = build_kulfan_airfoil_at_station(p, frac_mid)
             aero_2d = kaf.get_aero_from_neuralfoil(
                 alpha=alpha_local, Re=re_local, mach=0.0, model_size="large",
             )
-            cd_section = float(np.clip(aero_2d["CD"], 0.003, 0.10))
+            cd_section = float(np.clip(aero_2d["CD"], config.cd_clip_min, config.cd_clip_max))
         except Exception:
             # Flat-plate fallback
             cf = 1.328 / np.sqrt(max(re_local, 1e3))
@@ -67,20 +71,23 @@ def compute_wing_cd0(
 
     # Both half-wings, normalized by total S_ref
     s_ref_total = _compute_total_area(p)
-    cd0_wing = 2 * cd_total / s_ref_total * 1.05  # 5% interference
+    cd0_wing = 2 * cd_total / s_ref_total * config.interference_wing
     return cd0_wing
 
 
 def compute_body_cd0(
     params: BWBParams, alpha_eq: float, velocity: float,
     kinematic_viscosity: float, s_ref: float,
-    cd_intake: float = 0.0,
+    cd_intake: float = 0.0, config=None,
 ) -> float:
     """Center-body form drag with 3D correction.
 
     For thick sections (t/c > 12%), NeuralFoil 2D is unreliable.
     Uses analytical skin friction + Raymer form factor + 3D correction.
     """
+    from ..config import AeroModelConfig
+    if config is None:
+        config = AeroModelConfig()
     p = params
     bw = p.body_halfwidth
 
@@ -106,22 +113,22 @@ def compute_body_cd0(
     # Form factor (Raymer): accounts for pressure drag from thickness
     ff = 1.0 + 2.0 * avg_tc + 60 * avg_tc**4
 
-    # 3D form-drag correction for thick bodies (K ≈ 2.5)
-    K_3d = 2.5
-    if avg_tc > 0.12:
-        ff_3d = 1.0 + K_3d * (avg_tc - 0.12)**2
+    # 3D form-drag correction for thick bodies
+    K_3d = config.k_3d
+    if avg_tc > config.k_3d_tc_threshold:
+        ff_3d = 1.0 + K_3d * (avg_tc - config.k_3d_tc_threshold)**2
     else:
         ff_3d = 1.0
 
     # Wetted area ratio
-    s_wet_body = 2.05 * (p.body_root_chord + p.wing_root_chord) * bw
+    s_wet_body = config.wetted_area_ratio * (p.body_root_chord + p.wing_root_chord) * bw
     s_wet_ratio = 2 * s_wet_body / s_ref  # both halves
 
     # Body CD0
     cd0_body = cf * ff * ff_3d * s_wet_ratio
 
     # Interference factor
-    cd0_body *= 1.10
+    cd0_body *= config.interference_body
 
     # Add intake drag
     cd0_body += cd_intake

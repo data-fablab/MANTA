@@ -21,8 +21,13 @@ from .features import augment_features
 PRIMITIVE_TARGETS = [
     "CL_0", "CL_alpha", "CM_0", "CM_alpha",
     "CD0_wing", "CD0_body", "Cn_beta",
-    # v2: control surface derivatives (added by retrofit script)
-    "Cl_beta", "CLd01", "Cmd01",
+    # v2: control surface derivatives
+    "Cl_beta", "CL_de", "Cm_de",
+    # v3: trimmed CL from 2nd AVL run (non-linear, includes elevon effect)
+    "CL",
+    # v4: geometry/constraint targets (replaces _fast_* approximations)
+    "struct_mass", "internal_volume", "manufacturability_score",
+    "x_cg_frac", "Vs",
 ]
 
 # Backward-compatible: the original 7 targets for loading legacy models
@@ -39,8 +44,16 @@ _TARGET_CLIP = {
     "Cn_beta":   (-0.018, 0.028),   # 3xIQR filter: removes 734 extreme outliers (1.2%), skew 3.6→1.2
     # v2 control derivatives
     "Cl_beta":   (-2.0, 0.5),       # Roll due to sideslip (negative = stable dihedral effect)
-    "CLd01":     (-0.01, 0.30),     # CL per rad elevon deflection
-    "Cmd01":     (-0.10, 0.01),     # Cm per rad elevon (negative = nose-down for TE-down)
+    "CL_de":     (-0.01, 0.30),     # CL per rad elevon deflection
+    "Cm_de":     (-0.10, 0.01),     # Cm per rad elevon (negative = nose-down for TE-down)
+    # v3: trimmed quantities
+    "CL":        (-2.0, 3.0),      # Trimmed CL (from 2nd AVL run with elevon)
+    # v4: geometry/constraint targets
+    "struct_mass":              (0.1, 3.0),
+    "internal_volume":          (0.0001, 0.03),
+    "manufacturability_score":  (0.0, 1.0),
+    "x_cg_frac":                (0.2, 1.0),
+    "Vs":                       (5.0, 25.0),
 }
 
 
@@ -135,16 +148,32 @@ class SurrogateModel:
             # v2 control derivatives (from regeneration script)
             # Uses "Cl_beta" regenerated with consistent s_ref/b_ref normalization.
             cl_beta = r.get("Cl_beta", None)
-            cl_d01 = r.get("CLd01", None)
-            cmd01 = r.get("Cmd01", None)
+            cl_de = r.get("CL_de", None)
+            cm_de = r.get("Cm_de", None)
 
-            # Skip samples without control derivatives if we need 10 targets
-            if self._n_targets == 10 and (cl_d01 is None or cmd01 is None):
+            # v3: trimmed CL
+            cl_trimmed = r.get("CL", None)
+
+            # Skip samples without control derivatives if we need 10+ targets
+            if self._n_targets >= 10 and (cl_de is None or cm_de is None):
+                continue
+            if self._n_targets >= 11 and cl_trimmed is None:
                 continue
 
             row = [cl_0, cl_alpha, cm_0, cm_alpha, cd0_wing, cd0_body, cn_beta]
-            if self._n_targets == 10:
-                row.extend([cl_beta or 0.0, cl_d01, cmd01])
+            if self._n_targets >= 10:
+                row.extend([cl_beta or 0.0, cl_de, cm_de])
+            if self._n_targets >= 11:
+                row.append(cl_trimmed)
+            if self._n_targets >= 16:
+                struct_m = r.get("struct_mass", None)
+                int_vol = r.get("internal_volume", None)
+                manuf_s = r.get("manufacturability_score", None)
+                xcg_f = r.get("x_cg_frac", None)
+                vs_val = r.get("Vs", None)
+                if any(v is None for v in [struct_m, int_vol, manuf_s, xcg_f, vs_val]):
+                    continue
+                row.extend([struct_m, int_vol, manuf_s, xcg_f, vs_val])
 
             Y_rows.append(row)
             valid_indices.append(i)

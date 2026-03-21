@@ -1,7 +1,11 @@
 # Lazy imports to avoid pulling torch at package load time
 from .features import augment_features
 
-PRIMITIVE_TARGETS = ["CL_0", "CL_alpha", "CM_0", "CM_alpha", "CD0_wing", "CD0_body", "Cn_beta"]
+PRIMITIVE_TARGETS = [
+    "CL_0", "CL_alpha", "CM_0", "CM_alpha", "CD0_wing", "CD0_body", "Cn_beta",
+    "Cl_beta", "CL_de", "Cm_de",
+    "CL",
+]
 
 
 def __getattr__(name):

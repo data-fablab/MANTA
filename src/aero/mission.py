@@ -27,6 +27,7 @@ class MissionCondition:
     # Fixed component masses (see systems/avionics.py for detailed BOM)
     avionics_mass: float = 0.179    # [kg] detailed BOM (FC, Rx, GPS, ESC, servos, FPV, etc.)
     auxiliary_mass: float = 0.080   # [kg] linkages, camera window, FC mount, battery box
+    payload_mass: float = 0.200     # [kg] mission payload (camera, gimbal, sensors)
 
     # Propulsion system (fixed hardware)
     edf: EDFSpec = field(default_factory=lambda: EDF_70MM)
@@ -62,7 +63,8 @@ class MissionCondition:
     def mass_budget(self) -> float:
         """Available mass for airframe structure [kg]."""
         return (self.mtow - self.battery_mass - self.motor_mass
-                - self.avionics_mass - self.auxiliary_mass - self.duct_mass)
+                - self.avionics_mass - self.auxiliary_mass
+                - self.payload_mass - self.duct_mass)
 
     @property
     def atmosphere(self) -> asb.Atmosphere:
@@ -78,7 +80,8 @@ class MissionCondition:
 
     @property
     def weight(self) -> float:
-        return self.mtow * 9.81
+        from ..constants import G
+        return self.mtow * G
 
     @property
     def kinematic_viscosity(self) -> float:

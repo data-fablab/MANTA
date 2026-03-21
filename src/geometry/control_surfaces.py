@@ -13,6 +13,8 @@ from ..parameterization.bwb_aircraft import (
     build_kulfan_airfoil_at_station,
     OUTER_WING_STATIONS,
     N_OUTER_SEGMENTS,
+    outer_wing_twists,
+    outer_wing_dihedrals,
 )
 from ..aero.avl_runner import ControlConfig, ControlSurface
 
@@ -47,9 +49,8 @@ def compute_wing_le_positions(
 
     # Defining stations: LE positions and properties (7 stations, 6 segments)
     def_etas = np.array(OUTER_WING_STATIONS)
-    twist_055 = p.twist_2 + (0.55 - 0.50) / (0.75 - 0.50) * (p.twist_3 - p.twist_2)
-    def_twists = np.array([0.0, p.twist_1, p.twist_2, twist_055, p.twist_3, p.twist_4, p.twist_tip])
-    def_dihedrals = np.array([p.dihedral_0, p.dihedral_1, p.dihedral_2, p.dihedral_2, p.dihedral_3, p.dihedral_tip])
+    def_twists = np.array(outer_wing_twists(p))
+    def_dihedrals = np.array(outer_wing_dihedrals(p))
 
     # Chords (linear taper)
     def_chords = np.array([

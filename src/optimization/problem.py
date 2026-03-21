@@ -6,10 +6,12 @@ Supports two methods:
   analytical reconstruction for ranking, VLM validation on top candidates.
 """
 
+import os
 import time
 import numpy as np
 from scipy.optimize import differential_evolution, OptimizeResult
 from scipy.stats import qmc
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from ..parameterization.design_variables import (
     BWBParams,
@@ -27,16 +29,114 @@ from .database import EvaluationDatabase
 
 
 # ---------------------------------------------------------------------------
-# Batch VLM evaluation (sequential)
+# Batch VLM evaluation (parallel + sequential fallback)
 # ---------------------------------------------------------------------------
+
+# Per-worker evaluator (initialized once per process via _init_worker)
+_worker_evaluator = None
+
+
+def _init_worker():
+    """Initialize evaluator once per worker process (avoids re-import overhead)."""
+    global _worker_evaluator
+    from src.aero.evaluator import AeroEvaluator
+    from src.config import load_all
+    cfg = load_all()
+    _worker_evaluator = AeroEvaluator(
+        mission=cfg['mission'], feasibility=cfg['feasibility'],
+        controls=cfg['controls'], cg_config=cfg['cg'],
+        avl_command=cfg['avl_command'],
+        aero_model=cfg['aero_model'], structure_config=cfg['structure'],
+        use_cg=True,
+    )
+
+
+def _evaluate_single(x):
+    """Worker: evaluate one design using the pre-initialized evaluator."""
+    global _worker_evaluator
+    if _worker_evaluator is None:
+        _init_worker()
+    try:
+        params = params_from_vector(x)
+        return _worker_evaluator.evaluate(params)
+    except Exception as e:
+        return {"L_over_D": 0.0, "penalty": 999.0, "is_feasible": False,
+                "error": str(e)}
+
+
+# Persistent pool (created once, reused across calls)
+_pool = None
+_pool_n_workers = 0
+
+
+def _get_pool(n_workers):
+    """Get or create a persistent ProcessPoolExecutor."""
+    global _pool, _pool_n_workers
+    if _pool is None or _pool_n_workers != n_workers:
+        if _pool is not None:
+            _pool.shutdown(wait=False)
+        _pool = ProcessPoolExecutor(
+            max_workers=n_workers, initializer=_init_worker,
+        )
+        _pool_n_workers = n_workers
+    return _pool
+
 
 def _evaluate_batch(
     X: np.ndarray,
     mission: MissionCondition,
     feasibility: FeasibilityConfig | None = None,
     verbose: bool = True,
+    n_workers: int | None = None,
 ) -> list[dict]:
-    """Evaluate a batch of designs sequentially with progress reporting."""
+    """Evaluate a batch of designs, in parallel if n_workers > 1."""
+    n_designs = len(X)
+
+    if n_workers is None:
+        n_workers = min(os.cpu_count() or 1, 8)
+
+    if n_workers <= 1 or n_designs <= 2:
+        if verbose:
+            print(f"  [sequential mode: n_workers={n_workers}, n_designs={n_designs}]")
+        return _evaluate_batch_sequential(X, mission, feasibility, verbose)
+
+    # --- Parallel evaluation with persistent pool ---
+    if verbose:
+        print(f"  [parallel mode: {n_workers} workers, {n_designs} designs]")
+    pool = _get_pool(n_workers)
+    results = [None] * n_designs
+    t0 = time.time()
+    done = 0
+
+    future_to_idx = {
+        pool.submit(_evaluate_single, X[i]): i
+        for i in range(n_designs)
+    }
+    for future in as_completed(future_to_idx):
+        idx = future_to_idx[future]
+        try:
+            results[idx] = future.result()
+        except Exception as e:
+            results[idx] = {"L_over_D": 0.0, "penalty": 999.0,
+                            "is_feasible": False, "error": str(e)}
+        done += 1
+        if verbose and (done % 10 == 0 or done == n_designs):
+            elapsed = time.time() - t0
+            rate = done / elapsed if elapsed > 0 else 0
+            n_feas = sum(1 for r in results if r and r.get("is_feasible", False))
+            print(f"  evaluated {done:4d}/{n_designs} "
+                  f"({rate:.1f}/s, {n_feas} feasible)", flush=True)
+
+    return results
+
+
+def _evaluate_batch_sequential(
+    X: np.ndarray,
+    mission: MissionCondition,
+    feasibility: FeasibilityConfig | None = None,
+    verbose: bool = True,
+) -> list[dict]:
+    """Evaluate a batch of designs sequentially (fallback)."""
     evaluator = AeroEvaluator(mission, feasibility=feasibility)
     n_designs = len(X)
     results = []
@@ -49,11 +149,9 @@ def _evaluate_batch(
         if verbose and ((i + 1) % 20 == 0 or i == 0 or i == n_designs - 1):
             elapsed = time.time() - t0
             rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (n_designs - i - 1) / rate if rate > 0 else 0
             n_feas = sum(1 for r in results if r.get("is_feasible", False))
             print(f"  evaluated {i+1:4d}/{n_designs} "
-                  f"({rate:.1f}/s, ETA {eta:.0f}s, "
-                  f"{n_feas} feasible)", flush=True)
+                  f"({rate:.1f}/s, {n_feas} feasible)", flush=True)
 
     return results
 
@@ -224,19 +322,21 @@ def run_surrogate_assisted(
     surrogate_de_maxiter: int = 200,
     surrogate_de_popsize: int = 50,
     convergence_tol: float = 0.1,
+    trust_region_shrink: float = 0.5,
     seed: int = 42,
     verbose: bool = True,
 ) -> dict:
-    """Surrogate-assisted optimization using pre-trained MLP ensemble.
+    """Surrogate-assisted optimization with trust-region refinement.
 
-    Uses the pre-trained surrogate (60k samples) directly for cheap DE
-    exploration, then validates the best candidates with AVL.
+    Cycle 1: global DE on surrogate over full design space.
+    Cycles 2+: trust region centered on best feasible design,
+    bounds shrink by trust_region_shrink each cycle.
 
     1. Load pre-trained surrogate
-    2. Multi-restart DE on surrogate (fast, ~100k evaluations)
+    2. Multi-restart DE on surrogate (fast)
     3. Rank top candidates by surrogate objective + uncertainty penalty
     4. Validate top candidates with AVL
-    5. Inject validated points, retrain surrogate on augmented data, repeat
+    5. Shrink bounds around best design, repeat
     """
     from pathlib import Path
 
@@ -261,10 +361,25 @@ def run_surrogate_assisted(
         print(flush=True)
 
     best_ld = 0.0
+    best_x_global = None
+    current_lb = lb.copy()
+    current_ub = ub.copy()
 
     for cycle in range(max_cycles):
         if verbose:
             print(f"\n--- Cycle {cycle+1}/{max_cycles} ---")
+
+        # --- Trust region: shrink bounds around best design after Cycle 1 ---
+        if cycle > 0 and best_x_global is not None:
+            radius = (ub - lb) * trust_region_shrink ** cycle
+            current_lb = np.maximum(lb, best_x_global - radius)
+            current_ub = np.minimum(ub, best_x_global + radius)
+            if verbose:
+                pct = np.mean((current_ub - current_lb) / (ub - lb)) * 100
+                print(f"  Trust region: {pct:.0f}% of global bounds "
+                      f"(shrink={trust_region_shrink}^{cycle})")
+
+        cycle_bounds = list(zip(current_lb, current_ub))
 
         # --- Phase 1: Multi-restart DE on surrogate (cheap) ---
         if verbose:
@@ -277,7 +392,7 @@ def run_surrogate_assisted(
         for restart in range(n_restarts):
             surr_result = differential_evolution(
                 _surrogate_objective_vectorized,
-                bounds=bounds,
+                bounds=cycle_bounds,
                 args=(surrogate, feasibility, mission),
                 strategy="best1bin",
                 maxiter=surrogate_de_maxiter,
@@ -297,9 +412,9 @@ def run_surrogate_assisted(
         n_around = 200  # perturbations around each DE optimum
         perturbations = []
         for opt in de_optima:
-            sigma = 0.02 * (ub - lb)
+            sigma = 0.02 * (current_ub - current_lb)
             pts = opt + rng.normal(0, 1, size=(n_around, N_VARS)) * sigma
-            perturbations.append(np.clip(pts, lb, ub))
+            perturbations.append(np.clip(pts, current_lb, current_ub))
 
         pool = np.vstack([de_optima] + perturbations)
 
@@ -343,7 +458,7 @@ def run_surrogate_assisted(
 
         # --- Phase 3: Validate with AVL ---
         infill_results = _evaluate_batch(
-            candidates, mission, feasibility=feasibility, verbose=False,
+            candidates, mission, feasibility=feasibility, verbose=verbose,
         )
 
         n_feas = 0
@@ -367,6 +482,8 @@ def run_surrogate_assisted(
         best_x, best_r = db.best_feasible()
         best_ld = best_r["L_over_D"] if best_r else 0.0
         improvement = best_ld - prev_best_ld
+        if best_x is not None:
+            best_x_global = best_x.copy()
 
         cycle_history.append({
             "cycle": cycle + 1,

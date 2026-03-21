@@ -35,6 +35,25 @@ _FREE_INDICES = [2, 6, 7]  # optimizer-controlled Kulfan indices
 OUTER_WING_STATIONS = [0.0, 0.25, 0.50, 0.55, 0.75, 0.90, 1.0]
 N_OUTER_SEGMENTS = len(OUTER_WING_STATIONS) - 1
 
+def outer_wing_twists(p: 'BWBParams') -> list[float]:
+    """Build the 7-element twist list for OUTER_WING_STATIONS.
+
+    The twist at eta=0.55 is linearly interpolated between twist_2
+    (eta=0.50) and twist_3 (eta=0.75).
+    """
+    twist_055 = p.twist_2 + (0.55 - 0.50) / (0.75 - 0.50) * (p.twist_3 - p.twist_2)
+    return [0.0, p.twist_1, p.twist_2, twist_055, p.twist_3, p.twist_4, p.twist_tip]
+
+
+def outer_wing_dihedrals(p: 'BWBParams') -> list[float]:
+    """Build the 6-element dihedral list for OUTER_WING_STATIONS segments.
+
+    The segment eta=0.50->0.55 inherits dihedral_2 (same dihedral region).
+    """
+    return [p.dihedral_0, p.dihedral_1, p.dihedral_2, p.dihedral_2,
+            p.dihedral_3, p.dihedral_tip]
+
+
 # Body stations (fraction of body half-width)
 BODY_STATIONS = [0.0, 0.50, 1.0]
 N_BODY_SEGMENTS = len(BODY_STATIONS) - 1
@@ -358,14 +377,8 @@ def _build_outer_wing(params: BWBParams) -> asb.Wing:
     # Chords at each station (linear taper)
     chords = [root_chord + frac * (tip_chord - root_chord) for frac in OUTER_WING_STATIONS]
 
-    # Twists at each station (7 stations)
-    # eta=0.55 twist is interpolated between twist_2 (eta=0.50) and twist_3 (eta=0.75)
-    twist_055 = p.twist_2 + (0.55 - 0.50) / (0.75 - 0.50) * (p.twist_3 - p.twist_2)
-    twists = [0.0, p.twist_1, p.twist_2, twist_055, p.twist_3, p.twist_4, p.twist_tip]
-
-    # Dihedrals per segment (6 segments)
-    # Segment 0.50→0.55 inherits dihedral_2 (same dihedral region)
-    dihedrals = [p.dihedral_0, p.dihedral_1, p.dihedral_2, p.dihedral_2, p.dihedral_3, p.dihedral_tip]
+    twists = outer_wing_twists(p)
+    dihedrals = outer_wing_dihedrals(p)
 
     # Compute 3D positions from blend station outward
     wing_sweep_rad = np.radians(p.le_sweep_deg)
@@ -435,6 +448,7 @@ def estimate_structural_mass(
     sigma_material: float = 200e6,
     rho_material: float = 1500.0,
     mtow: float = 1.5,
+    structure_config=None,
 ) -> float:
     """Estimate structural mass [kg] for composite BWB.
 
@@ -447,13 +461,19 @@ def estimate_structural_mass(
     rho_material : material density [kg/m³] (1500 for composite)
     mtow : max takeoff weight [kg] (for bending moment)
     """
+    from ..config import StructureConfig
+    if structure_config is None:
+        structure_config = StructureConfig()
+    if density_kg_m2 == 0.6:
+        density_kg_m2 = structure_config.skin_density_kg_m2
+
     # Avg thickness from root Kulfan
     root_kaf = build_kulfan_airfoil_at_station(params, 0.0)
     tip_kaf = build_kulfan_airfoil_at_station(params, 1.0)
     avg_tc_wing = (root_kaf.max_thickness() + tip_kaf.max_thickness()) / 2
 
     # Body contribution: thicker → more material
-    avg_tc_body = params.body_tc_root * 0.8
+    avg_tc_body = params.body_tc_root * structure_config.body_tc_correction
 
     # Shell mass: wetted area × density × (1 + t/c correction)
     wing_wetted = 2.05 * (params.wing_root_chord + params.tip_chord) * params.outer_half_span
@@ -466,7 +486,8 @@ def estimate_structural_mass(
 
     # Spar mass: beam bending model
     # Triangular load approximation → root bending moment
-    weight = mtow * 9.81
+    from ..constants import G
+    weight = mtow * G
     half_span = params.half_span
     m_root = 0.5 * n_load * fos * weight * half_span / 3.0
 
@@ -478,8 +499,7 @@ def estimate_structural_mass(
     a_cap = m_root / (sigma_material * h_spar)
     spar_mass = 2.0 * a_cap * half_span * rho_material
 
-    # Ribs, fittings, adhesive: +20% adder
-    return (shell_mass + spar_mass) * 1.20
+    return (shell_mass + spar_mass) * structure_config.structural_adder
 
 
 def compute_internal_volume(params: BWBParams, packing_factor: float = 0.55) -> float:

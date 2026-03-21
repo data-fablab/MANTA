@@ -14,10 +14,12 @@ from ..parameterization.design_variables import BWBParams
 from ..parameterization.bwb_aircraft import (
     OUTER_WING_STATIONS,
     compute_internal_volume,
+    outer_wing_twists,
+    outer_wing_dihedrals,
 )
 
 
-def compute_manufacturability(params: BWBParams) -> dict:
+def compute_manufacturability(params: BWBParams, config=None) -> dict:
     """Compute manufacturability metrics for a BWB design.
 
     Returns a dict with individual metrics and a composite score [0-1]
@@ -28,7 +30,7 @@ def compute_manufacturability(params: BWBParams) -> dict:
 
     # ── 1. Twist distribution analysis ────────────────────────────────────
     # Aggressive washout complicates composite layup and mold design.
-    twists = [0.0, p.twist_1, p.twist_2, p.twist_3, p.twist_4, p.twist_tip]
+    twists = outer_wing_twists(p)
     stations = OUTER_WING_STATIONS  # [0, 0.25, 0.5, 0.75, 0.9, 1.0]
     outer_span = p.outer_half_span  # meters
 
@@ -44,8 +46,7 @@ def compute_manufacturability(params: BWBParams) -> dict:
 
     # ── 2. Dihedral distribution analysis ─────────────────────────────────
     # Dihedral sign changes require complex jigs / multi-part molds.
-    dihedrals = [p.dihedral_0, p.dihedral_1, p.dihedral_2,
-                 p.dihedral_3, p.dihedral_tip]
+    dihedrals = outer_wing_dihedrals(p)
 
     dihedral_gradients = []
     for i in range(len(dihedrals) - 1):
@@ -108,49 +109,43 @@ def compute_manufacturability(params: BWBParams) -> dict:
     # ══════════════════════════════════════════════════════════════════════
     # Composite score [0, 1]: 1 = easy to manufacture
     # ══════════════════════════════════════════════════════════════════════
-    # Each sub-score maps a metric to [0, 1] via linear ramps.
+    from ..config import ManufConfig
+    if config is None:
+        config = ManufConfig()
+    w = config.weights
+    t = config.thresholds
 
     scores = []
 
-    # Twist gradient: < 5 °/m is easy, > 20 °/m is very hard
-    s_twist = _ramp(metrics["twist_gradient_max"], good=5.0, bad=20.0)
-    scores.append(("twist_smoothness", s_twist, 0.15))
+    s_twist = _ramp(metrics["twist_gradient_max"], good=t["twist_gradient"][0], bad=t["twist_gradient"][1])
+    scores.append(("twist_smoothness", s_twist, w["twist_smoothness"]))
 
-    # Dihedral gradient: < 30 °/m is easy, > 100 °/m is hard
-    s_dihedral = _ramp(metrics["dihedral_gradient_max"], good=30.0, bad=100.0)
-    scores.append(("dihedral_smoothness", s_dihedral, 0.10))
+    s_dihedral = _ramp(metrics["dihedral_gradient_max"], good=t["dihedral_gradient"][0], bad=t["dihedral_gradient"][1])
+    scores.append(("dihedral_smoothness", s_dihedral, w["dihedral_smoothness"]))
 
-    # Dihedral breaks: 0 is ideal, 3+ is bad
-    s_breaks = _ramp(metrics["n_dihedral_breaks"], good=0.0, bad=3.0)
-    scores.append(("dihedral_simplicity", s_breaks, 0.10))
+    s_breaks = _ramp(metrics["n_dihedral_breaks"], good=t["dihedral_breaks"][0], bad=t["dihedral_breaks"][1])
+    scores.append(("dihedral_simplicity", s_breaks, w["dihedral_simplicity"]))
 
-    # Tip thickness: > 8 mm is easy, < 3 mm is hard
-    s_thickness = _ramp_inv(metrics["thickness_tip_mm"], good=8.0, bad=3.0)
-    scores.append(("tip_robustness", s_thickness, 0.15))
+    s_thickness = _ramp_inv(metrics["thickness_tip_mm"], good=t["tip_thickness_mm"][0], bad=t["tip_thickness_mm"][1])
+    scores.append(("tip_robustness", s_thickness, w["tip_robustness"]))
 
-    # Taper: ratio > 0.25 is easy, < 0.08 is hard
-    s_taper = _ramp_inv(metrics["taper_ratio"], good=0.25, bad=0.08)
-    scores.append(("taper_simplicity", s_taper, 0.10))
+    s_taper = _ramp_inv(metrics["taper_ratio"], good=t["taper_ratio"][0], bad=t["taper_ratio"][1])
+    scores.append(("taper_simplicity", s_taper, w["taper_simplicity"]))
 
-    # Chord ratio: < 1.3 is easy, > 2.0 is hard
-    s_blend = _ramp(metrics["body_chord_ratio"], good=1.3, bad=2.0)
-    scores.append(("blend_smoothness", s_blend, 0.10))
+    s_blend = _ramp(metrics["body_chord_ratio"], good=t["chord_ratio"][0], bad=t["chord_ratio"][1])
+    scores.append(("blend_smoothness", s_blend, w["blend_smoothness"]))
 
-    # Sweep delta: < 3° is easy, > 12° is hard
-    s_sweep = _ramp(metrics["sweep_delta"], good=3.0, bad=12.0)
-    scores.append(("sweep_continuity", s_sweep, 0.05))
+    s_sweep = _ramp(metrics["sweep_delta"], good=t["sweep_delta"][0], bad=t["sweep_delta"][1])
+    scores.append(("sweep_continuity", s_sweep, w["sweep_continuity"]))
 
-    # Twist range: < 3° is easy, > 8° is hard
-    s_twist_range = _ramp(metrics["twist_range"], good=3.0, bad=8.0)
-    scores.append(("twist_simplicity", s_twist_range, 0.10))
+    s_twist_range = _ramp(metrics["twist_range"], good=t["twist_range"][0], bad=t["twist_range"][1])
+    scores.append(("twist_simplicity", s_twist_range, w["twist_simplicity"]))
 
-    # Volume: > 0.004 m³ is easy, < 0.002 m³ is hard
-    s_vol = _ramp_inv(metrics["internal_volume_m3"], good=0.004, bad=0.002)
-    scores.append(("equipment_space", s_vol, 0.10))
+    s_vol = _ramp_inv(metrics["internal_volume_m3"], good=t["volume"][0], bad=t["volume"][1])
+    scores.append(("equipment_space", s_vol, w["equipment_space"]))
 
-    # Span: < 0.8m is easy, > 1.0m is hard (transport, mold size)
-    s_span = _ramp(metrics["half_span"], good=0.8, bad=1.0)
-    scores.append(("mold_size", s_span, 0.05))
+    s_span = _ramp(metrics["half_span"], good=t["half_span"][0], bad=t["half_span"][1])
+    scores.append(("mold_size", s_span, w["mold_size"]))
 
     # Store sub-scores
     total_weight = sum(w for _, _, w in scores)

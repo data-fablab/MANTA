@@ -17,9 +17,7 @@ from .duct_geometry import DuctPlacement
 from ..parameterization.design_variables import BWBParams
 
 
-# Standard atmosphere at 100m altitude
-RHO_AIR = 1.215       # [kg/m³]
-MU_AIR = 1.81e-5      # [Pa·s] dynamic viscosity
+from ..constants import RHO_SEA_LEVEL, MU_SEA_LEVEL
 
 
 @dataclass
@@ -58,7 +56,8 @@ class DuctAeroResult:
 
 def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
                       params: BWBParams, velocity: float = 20.0,
-                      rho: float = RHO_AIR) -> DuctAeroResult:
+                      rho: float = RHO_SEA_LEVEL,
+                      config=None) -> DuctAeroResult:
     """Compute complete duct aerodynamic performance.
 
     Parameters
@@ -75,6 +74,9 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
     -------
     DuctAeroResult
     """
+    from ..config import DuctAeroConfig
+    if config is None:
+        config = DuctAeroConfig()
     warnings = []
 
     # ── Fan face conditions ──
@@ -99,7 +101,7 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
     if velocity > 0.5:
         intake_capture_area = mass_flow / (rho * velocity)
     else:
-        intake_capture_area = fan_area * 1.2  # static: larger than fan
+        intake_capture_area = fan_area * config.static_capture_factor
 
     actual_intake_area = placement.intake_width * placement.intake_depth
     if actual_intake_area < intake_capture_area * 0.9:
@@ -111,7 +113,7 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
     # ── Intake pressure recovery ──
     # NACA flush intake: PR ≈ 0.92-0.97 depending on BL thickness
     # Conservative estimate for thick BL on BWB upper surface
-    pr_intake = 0.95
+    pr_intake = config.pr_intake
 
     # ── S-duct pressure recovery ──
     # Seddon & Goldsmith correlation: dp/q = K * (offset/L)^2
@@ -128,7 +130,7 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
             "(high risk of flow separation)"
         )
 
-    k_sduct = 0.15  # moderate design quality
+    k_sduct = config.k_sduct
     dp_q_sduct = k_sduct * offset_ratio ** 2
     pr_sduct = 1.0 - dp_q_sduct
 
@@ -138,7 +140,7 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
 
     # Nozzle pressure loss (friction + expansion/contraction)
     # For a short convergent nozzle: PR ≈ 0.97-0.99
-    pr_nozzle = 0.98
+    pr_nozzle = config.pr_nozzle
 
     # Exit velocity from mass flow continuity
     if exhaust_exit_area > 0:
@@ -161,7 +163,7 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
     s_ref = float(np.pi / 4 * edf.intake_diameter ** 2)
     wing_area = ((params.body_root_chord + params.wing_root_chord) * params.body_halfwidth
                  + (params.wing_root_chord + params.tip_chord) * params.outer_half_span)
-    cd_intake = 0.05 * s_ref / wing_area if wing_area > 0 else 0.0
+    cd_intake = config.cd_intake_base * s_ref / wing_area if wing_area > 0 else 0.0
 
     return DuctAeroResult(
         mass_flow=mass_flow,

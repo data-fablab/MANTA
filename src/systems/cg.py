@@ -53,6 +53,7 @@ def compute_cg(
     edf_mass: float,
     avionics_mass: float,
     config: CGConfig | None = None,
+    structure_config=None,
 ) -> dict:
     """Compute aircraft CG from structural mass distribution + components.
 
@@ -70,7 +71,10 @@ def compute_cg(
     dict with x_cg, y_cg, z_cg [m], total_mass [kg], components list,
     and x_cg_frac (x_cg / body_root_chord for quick SM check).
     """
+    from ..config import StructureConfig
     config = config or DEFAULT_CG_CONFIG
+    if structure_config is None:
+        structure_config = StructureConfig()
     body_chord = params.body_root_chord
     bw = params.body_halfwidth
 
@@ -82,21 +86,22 @@ def compute_cg(
     root_kaf = build_kulfan_airfoil_at_station(params, 0.0)
     tip_kaf = build_kulfan_airfoil_at_station(params, 1.0)
     avg_tc_wing = (root_kaf.max_thickness() + tip_kaf.max_thickness()) / 2
-    avg_tc_body = params.body_tc_root * 0.8
+    avg_tc_body = params.body_tc_root * structure_config.body_tc_correction
 
     wing_wetted = 2.05 * (params.wing_root_chord + params.tip_chord) * params.outer_half_span
     body_wetted = 2.05 * (body_chord + params.wing_root_chord) * bw
 
-    density_kg_m2 = 0.6
+    density_kg_m2 = structure_config.skin_density_kg_m2
     shell_wing = density_kg_m2 * wing_wetted * (1 + avg_tc_wing)
     shell_body = density_kg_m2 * body_wetted * (1 + avg_tc_body)
 
     total_struct = estimate_structural_mass(params)
     shell_total = shell_wing + shell_body
     # Spar mass and adder go to wing
-    spar_and_rib = total_struct - shell_total * 1.20 / 1.20  # remove adder for split
+    adder = structure_config.structural_adder
+    spar_and_rib = total_struct - shell_total * adder / adder  # remove adder for split
     # Approximate: body gets shell_body, wing gets shell_wing + spar
-    body_struct = shell_body * 1.20  # with 20% adder
+    body_struct = shell_body * adder
     wing_struct = total_struct - body_struct
 
     components = []
@@ -203,14 +208,18 @@ def compute_mass_budget(
     avionics_mass: float,
     mtow: float = 1.5,
     config: CGConfig | None = None,
+    structure_config=None,
 ) -> dict:
     """Detailed mass budget with margins and reserves.
 
     Returns hierarchical dict with category subtotals, margins, and
     comparison to MTOW.
     """
+    from ..config import StructureConfig
     config = config or DEFAULT_CG_CONFIG
-    cg_result = compute_cg(params, battery_mass, edf_mass, avionics_mass, config)
+    if structure_config is None:
+        structure_config = StructureConfig()
+    cg_result = compute_cg(params, battery_mass, edf_mass, avionics_mass, config, structure_config)
 
     # Split structural mass
     total_struct = estimate_structural_mass(params, mtow=mtow)
@@ -219,24 +228,25 @@ def compute_mass_budget(
     root_kaf = build_kulfan_airfoil_at_station(params, 0.0)
     tip_kaf = build_kulfan_airfoil_at_station(params, 1.0)
     avg_tc_wing = (root_kaf.max_thickness() + tip_kaf.max_thickness()) / 2
-    avg_tc_body = params.body_tc_root * 0.8
+    avg_tc_body = params.body_tc_root * structure_config.body_tc_correction
     body_chord = params.body_root_chord
 
     wing_wetted = 2.05 * (params.wing_root_chord + params.tip_chord) * params.outer_half_span
     body_wetted = 2.05 * (body_chord + params.wing_root_chord) * params.body_halfwidth
 
-    density_kg_m2 = 0.6
+    density_kg_m2 = structure_config.skin_density_kg_m2
     shell_wing = density_kg_m2 * wing_wetted * (1 + avg_tc_wing)
     shell_body = density_kg_m2 * body_wetted * (1 + avg_tc_body)
-    body_struct = shell_body * 1.20
+    adder = structure_config.structural_adder
+    body_struct = shell_body * adder
     wing_struct = total_struct - body_struct
 
     # Itemized budget
     items = {
         "airframe": {
-            "body_shell": {"mass_kg": shell_body, "margin": 0.20},
-            "wing_shell": {"mass_kg": shell_wing, "margin": 0.20},
-            "spar_ribs_adhesive": {"mass_kg": wing_struct - shell_wing * 1.20, "margin": 0.10},
+            "body_shell": {"mass_kg": shell_body, "margin": adder - 1.0},
+            "wing_shell": {"mass_kg": shell_wing, "margin": adder - 1.0},
+            "spar_ribs_adhesive": {"mass_kg": wing_struct - shell_wing * adder, "margin": 0.10},
             "subtotal": total_struct,
         },
         "propulsion": {

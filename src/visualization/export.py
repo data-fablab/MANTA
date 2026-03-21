@@ -376,9 +376,9 @@ def export_cad_profiles(params: BWBParams, output_dir: str,
     wing_labels = ["root", "25pct", "50pct", "55pct", "75pct", "90pct", "tip"]
     wing_chords = [p.wing_root_chord + frac * (tip_chord - p.wing_root_chord)
                    for frac in OUTER_WING_STATIONS]
-    twist_055 = p.twist_2 + (0.55 - 0.50) / (0.75 - 0.50) * (p.twist_3 - p.twist_2)
-    wing_twists = [0.0, p.twist_1, p.twist_2, twist_055, p.twist_3, p.twist_4, p.twist_tip]
-    wing_dihedrals = [p.dihedral_0, p.dihedral_1, p.dihedral_2, p.dihedral_2, p.dihedral_3, p.dihedral_tip]
+    from ..parameterization.bwb_aircraft import outer_wing_twists, outer_wing_dihedrals
+    wing_twists = outer_wing_twists(p)
+    wing_dihedrals = outer_wing_dihedrals(p)
 
     # LE position at blend
     x_blend = bw * np.tan(body_sweep_rad)

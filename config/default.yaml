@@ -2,36 +2,38 @@
 # All parameters used across the MDO pipeline.
 
 mission:
-  velocity_ms: 20.0
+  velocity_ms: 25.0
   altitude_m: 100.0
-  mtow_kg: 1.5
-  avionics_mass_kg: 0.10
+  mtow_kg: 2.5
+  avionics_mass_kg: 0.179     # from avionics BOM (20 components)
+  auxiliary_mass_kg: 0.080    # linkages, camera window, FC mount, battery box
+  payload_mass_kg: 0.200      # GoPro + 2-axis gimbal
   edf: EDF_70MM
   battery: BATTERY_3S_1800
 
 feasibility:
   # Static margin [fraction MAC]
-  sm_min: 0.05
-  sm_max: 0.25
+  sm_min: -0.05             # slightly unstable OK with FC (ArduPilot)
+  sm_max: 0.55              # BWB with FC handles high SM — relaxed for L/D optimization
   # Trim
   cm_max: 0.20
   cl_max: 0.75
   cl_min: 0.05
-  ar_min: 4.5
-  volume_min: 0.002        # [m3]
-  cn_beta_min: 0.005
+  ar_min: 4.0               # relaxed for wider body designs
+  volume_min: 0.0008        # [m3] ~800 cm3, tight but realistic for compact BWB
+  cn_beta_min: 0.001         # flying wing with winglets, yaw damper in FC
   # Propulsion
-  td_min: 1.2
-  endurance_min: 480.0     # [s]
-  drag_margin: 1.25
+  td_min: 1.0               # marginal but flyable at 25 m/s
+  endurance_min: 300.0       # [s] 5 min — realistic for 2.5kg UCAV @ 25 m/s
+  drag_margin: 1.20          # reduced: NeuralFoil + AVL are reasonably accurate
   # Stall / control
-  vs_max: 12.0             # [m/s]
+  vs_max: 15.0               # [m/s] higher wing loading at 2.5 kg
   cl_max_clean: 0.85
-  alpha_trim_max: 10.0     # [deg]
-  elevon_deflection_max: 15.0  # [deg]
+  alpha_trim_max: 12.0       # [deg] relaxed for high CL designs
+  elevon_deflection_max: 20.0  # [deg] standard servo range
   cl_beta_cn_beta_max: -30.0
   # Manufacturability
-  manufacturability_min: 0.40
+  manufacturability_min: 0.25  # relaxed: composite expertise assumed
   # Penalty weights
   weights:
     w_sm_lo: 20.0
@@ -73,8 +75,74 @@ controls:
 avl:
   command: "d:/UAV/tools/avl/avl.exe"
   chordwise_res: 6
-  spanwise_res: 8
+  spanwise_res: 20              # >=16 required for eta=0.55 short segment
   timeout: 10.0
+
+# ── Aerodynamic model tuning ──
+aero_model:
+  re_clip: [50000, 500000]       # Reynolds number clip range
+  alpha_clip: [-5.0, 15.0]       # [deg] AoA clip for NeuralFoil
+  cd_clip: [0.003, 0.10]         # section CD clip
+  interference_wing: 1.05        # wing-body junction (+5%)
+  interference_body: 1.10        # body interference (+10%)
+  wetted_area_ratio: 2.05        # planform → wetted area
+  k_3d: 2.5                      # 3D form drag correction
+  k_3d_tc_threshold: 0.12        # t/c threshold for K_3d
+  alpha_trim_clip: [-2.0, 12.0]  # [deg] trim alpha clip
+
+# ── Duct geometry placement ──
+duct:
+  intake_x_frac: 0.04            # intake at 4% body chord
+  fan_x_frac: 0.40               # fan at 40% body chord
+  exhaust_x_frac: 0.93           # exhaust at 93% body chord
+  intake_width_factor: 1.8       # × fan_diameter
+  intake_depth_factor: 0.5       # × fan_diameter
+  intake_ramp_factor: 3.0        # × intake_depth
+  nozzle_area_ratio: 0.80        # exhaust / fan area
+  duct_wall_mm: 1.0              # [mm] composite wall thickness
+  housing_length_factor: 1.5     # × fan_diameter
+  material_density: 1500          # [kg/m³] composite duct
+  structural_adder: 1.30         # flanges, pylons, firewall
+
+# ── Duct aerodynamics ──
+duct_aero:
+  pr_intake: 0.95                # NACA flush intake pressure recovery
+  k_sduct: 0.15                  # S-duct loss coefficient
+  pr_nozzle: 0.98                # nozzle pressure recovery
+  cd_intake_base: 0.05           # intake drag coefficient
+  static_capture_factor: 1.2     # fan_area × this for static capture
+
+# ── Structural mass model ──
+structure:
+  skin_density_kg_m2: 0.6        # [kg/m²] composite shell areal density
+  structural_adder: 1.20         # +20% for ribs, adhesive, misc
+  body_tc_correction: 0.8        # body t/c correction factor
+  gyration_radius_factor: 0.3    # k_yy for Iy estimation
+
+# ── Manufacturability scoring ──
+manufacturability:
+  weights:
+    twist_smoothness: 0.15
+    dihedral_smoothness: 0.10
+    dihedral_simplicity: 0.10
+    tip_robustness: 0.15
+    taper_simplicity: 0.10
+    blend_smoothness: 0.10
+    sweep_continuity: 0.05
+    twist_simplicity: 0.10
+    equipment_space: 0.10
+    mold_size: 0.05
+  thresholds:
+    twist_gradient: [5.0, 20.0]           # [good, bad] °/m
+    dihedral_gradient: [30.0, 100.0]      # [good, bad] °/m
+    dihedral_breaks: [0.0, 3.0]           # [good, bad] count
+    tip_thickness_mm: [8.0, 3.0]          # [good, bad] mm (inverted ramp)
+    taper_ratio: [0.25, 0.08]             # [good, bad] (inverted ramp)
+    chord_ratio: [1.3, 2.0]              # [good, bad]
+    sweep_delta: [3.0, 12.0]             # [good, bad] deg
+    twist_range: [3.0, 8.0]              # [good, bad] deg
+    volume: [0.004, 0.002]               # [good, bad] m³ (inverted ramp)
+    half_span: [0.8, 1.0]                # [good, bad] m
 
 surrogate:
   path: "models/surrogate_v2_ctrl"
@@ -86,7 +154,7 @@ optimization:
   n_restarts: 3
   n_infill: 40
   max_cycles: 6
-  de_maxiter: 200
-  de_popsize: 50
+  de_maxiter: 100
+  de_popsize: 3           # MULTIPLIER: 3 × N_VARS = 90 individuals
   convergence_tol: 0.02
   seed: 42

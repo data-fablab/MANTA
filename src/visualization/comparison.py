@@ -10,6 +10,7 @@ import matplotlib
 if matplotlib.get_backend() == "agg":
     pass  # already set by plots.py or non-interactive context
 import matplotlib.pyplot as plt
+from .style import COLORS, FONT_SIZES, save_fig
 from ..parameterization.design_variables import BWBParams
 from ..parameterization.bwb_aircraft import (
     OUTER_WING_STATIONS,
@@ -90,7 +91,7 @@ def plot_pareto(catalog, obj_x: str = "manufacturability_score",
             handles.append(Line2D([0], [0], marker='o', color='w',
                                   markerfacecolor=color, markersize=10,
                                   label=origin))
-    ax.legend(handles=handles, loc="lower right", fontsize=9)
+    ax.legend(handles=handles, loc="lower right", fontsize=FONT_SIZES["legend"])
 
     ax.set_xlabel(obj_x.replace("_", " ").title(), fontsize=11)
     ax.set_ylabel(obj_y.replace("_", " ").title(), fontsize=11)
@@ -99,7 +100,7 @@ def plot_pareto(catalog, obj_x: str = "manufacturability_score",
 
     if save_path:
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        save_fig(plt.gcf(), save_path)
     if show:
         plt.tight_layout()
         return fig
@@ -169,13 +170,13 @@ def plot_radar(catalog, designs: list[str] | None = None,
     ax.set_ylim(0, 1)
     ax.set_yticks([0.25, 0.5, 0.75, 1.0])
     ax.set_yticklabels(["25%", "50%", "75%", "100%"], fontsize=8, alpha=0.5)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=FONT_SIZES["legend"])
     ax.set_title("Multi-Criteria Design Comparison", fontsize=13,
                  fontweight="bold", pad=20)
 
     if save_path:
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        save_fig(plt.gcf(), save_path)
     return fig
 
 
@@ -213,7 +214,7 @@ def plot_planform_overlay(catalog, designs: list[str] | None = None,
 
     if save_path:
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        save_fig(plt.gcf(), save_path)
     return fig
 
 
@@ -335,5 +336,5 @@ def plot_summary_table(catalog, designs: list[str] | None = None,
     ax.set_title("Design Catalog Summary", fontsize=13, fontweight="bold", pad=20)
 
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        save_fig(plt.gcf(), save_path)
     return fig

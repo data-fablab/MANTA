@@ -881,6 +881,101 @@ def _make_periodic_wire(pts_3d: np.ndarray, tol_mm: float = 1e-3):
     return wire
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Densified loft — uniform intermediate sections for flat control surfaces
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _densify_sections(
+    params: BWBParams,
+    all_sections: list[np.ndarray],
+    n_profile: int = 100,
+    n_interp: int = 4,
+) -> list[np.ndarray]:
+    """Add intermediate sections uniformly across the entire span.
+
+    Inserts *n_interp* sections between each pair of defining stations
+    to produce a uniformly dense set.  This balances the C2 loft
+    parameterisation and prevents distortion from uneven spacing.
+
+    - **Body segments** (merged 0-1, 1-2): linear interpolation of
+      3D coordinates (body airfoils transition smoothly).
+    - **Wing control zones**: true Kulfan CST profiles with
+      ``flatten_airfoil_aft`` (correct aerodynamic shape + flat TE).
+    - **Wing non-control zones**: true Kulfan CST profiles without
+      flattening (correct aerodynamic shape, smooth TE).
+
+    Parameters
+    ----------
+    params : BWBParams
+        Aircraft design parameters.
+    all_sections : list of (n_profile, 3) arrays
+        The 9 merged defining sections (body[0:3] + wing[1:7]).
+    n_profile : int
+        Points per airfoil side for intermediate profiles.
+    n_interp : int
+        Number of intermediate sections per segment pair. Default 4.
+
+    Returns
+    -------
+    list of (n_profile, 3) arrays
+        Densified section list (defining + intermediates).
+    """
+    from ..geometry.control_surfaces import classify_wing_segments, compute_wing_le_positions
+    from ..aero.avl_runner import ControlConfig
+
+    wing_groups = classify_wing_segments()
+    x_hinge = ControlConfig.default_bwb().surfaces[0].xhinge  # 0.75
+    BODY_OFFSET = 2  # wing[j] → merged index 2+j
+    N_BODY = len(BODY_STATIONS)  # 3
+
+    # Map each (merged_start, merged_end) pair to its type
+    # Body pairs: linear interpolation
+    # Wing ruled pairs: Kulfan + flatten
+    # Wing spline pairs: Kulfan (no flatten)
+    pair_info: dict[tuple[int, int], tuple[str, float, float]] = {}
+
+    # Body segments
+    for k in range(N_BODY - 1):
+        pair_info[(k, k + 1)] = ('body', BODY_STATIONS[k], BODY_STATIONS[k + 1])
+
+    # Wing segments
+    for ws, we, ltype in wing_groups:
+        for k in range(ws, we):
+            eta_lo = OUTER_WING_STATIONS[k]
+            eta_hi = OUTER_WING_STATIONS[k + 1]
+            seg_type = 'ruled' if ltype == 'ruled' else 'spline'
+            pair_info[(BODY_OFFSET + k, BODY_OFFSET + k + 1)] = (seg_type, eta_lo, eta_hi)
+
+    densified = [all_sections[0]]
+    for i in range(len(all_sections) - 1):
+        info = pair_info.get((i, i + 1))
+        if info is not None:
+            seg_type, param_lo, param_hi = info
+            for k in range(1, n_interp + 1):
+                t = k / (n_interp + 1)
+                if seg_type == 'body':
+                    # Linear interpolation of 3D coordinates
+                    densified.append(
+                        (1.0 - t) * all_sections[i] + t * all_sections[i + 1]
+                    )
+                else:
+                    # True Kulfan profile at interpolated eta
+                    eta = param_lo + t * (param_hi - param_lo)
+                    le_xyz, chords, twists = compute_wing_le_positions(
+                        params, np.array([eta]),
+                    )
+                    flatten = x_hinge if seg_type == 'ruled' else None
+                    sec = _build_section_at_eta(
+                        params, eta, n_profile,
+                        le_xyz[0], chords[0], twists[0],
+                        flatten_aft=flatten,
+                    )
+                    densified.append(sec)
+        densified.append(all_sections[i + 1])
+
+    return densified
+
+
 def export_aircraft_step_v2(params: BWBParams, path: str,
                             n_profile: int = 100) -> dict:
     """Export BWB aircraft as a watertight STEP solid via ThruSections loft.
@@ -924,10 +1019,11 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
     wing_sections = _build_wing_sections(p, n_profile)
     all_sections = body_sections + wing_sections[1:]  # merge at blend
 
-    # ── 2b. Convert each section to a periodic BSpline wire ──
-    wires = [_make_periodic_wire(sec) for sec in all_sections]
+    # ── 2b. Densify control zones with intermediate sections ──
+    dense_sections = _densify_sections(p, all_sections, n_profile)
+    wires = [_make_periodic_wire(sec) for sec in dense_sections]
 
-    # ── 2c. Single C2 loft (profiles have flat TE in control zones) ──
+    # ── 2c. Single C2 loft (densified stations keep TE flat) ──
     loft = BRepOffsetAPI_ThruSections(True, False)  # isSolid=True, ruled=False
     loft.SetMaxDegree(6)
     loft.SetContinuity(GeomAbs_C2)
@@ -1013,7 +1109,9 @@ def export_aircraft_step_v2(params: BWBParams, path: str,
         "surface_area_mm2": round(surface_area_mm2, 1),
         "is_valid": is_valid,
         "max_deviation_mm": round(max_dev, 4),
-        "n_sections": len(all_sections),
+        "n_sections_defining": len(all_sections),
+        "n_sections_dense": len(dense_sections),
+        "loft_mode": "densified",
     }
 
 
@@ -1210,9 +1308,10 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
     wing_sections = _build_wing_sections(p, n_profile)
     all_sections = body_sections + wing_sections[1:]
 
-    wires = [_make_periodic_wire(sec) for sec in all_sections]
+    dense_sections = _densify_sections(p, all_sections, n_profile)
+    wires = [_make_periodic_wire(sec) for sec in dense_sections]
 
-    # Single C2 loft (profiles have flat TE in control zones)
+    # Single C2 loft (densified stations keep TE flat)
     loft = BRepOffsetAPI_ThruSections(True, False)
     loft.SetMaxDegree(6)
     loft.SetContinuity(GeomAbs_C2)
@@ -1517,9 +1616,11 @@ def export_aircraft_step_v3(params: BWBParams, path: str,
         "duct_size_kb": round(duct_kb, 1),
         "hinge_path": hinge_path,
         "hinge_size_kb": round(hinge_kb, 1),
-        "n_oml_sections": len(all_sections),
+        "n_oml_sections_defining": len(all_sections),
+        "n_oml_sections_dense": len(dense_sections),
         "n_duct_sections": len(all_duct_secs),
         "n_hinge_wires": n_hinge_wires,
+        "loft_mode": "densified",
     }
 
     print("[v3] Done: %.0f KB, valid=%s, boolean=%s, vol=%.1f cm3, hinge_wires=%d" % (

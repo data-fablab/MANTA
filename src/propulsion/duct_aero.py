@@ -122,7 +122,7 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
     sduct_length = abs(placement.fan_x - (placement.intake_x + placement.intake_length))
     sduct_length = max(sduct_length, 0.01)  # avoid division by zero
 
-    offset_ratio = sduct_offset / sduct_length
+    offset_ratio = min(sduct_offset / sduct_length, 0.8)  # clip to physical range
 
     if offset_ratio > 0.5:
         warnings.append(

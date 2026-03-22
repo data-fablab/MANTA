@@ -1,15 +1,13 @@
-"""BWB optimization using Differential Evolution.
+"""BWB optimization pipeline.
 
-Supports two methods:
-- 'de': Single-objective DE with VLM evaluation (Neuronautics approach)
-- 'surrogate': Surrogate-assisted DE -- MLP predicts 7 VLM primitives,
-  analytical reconstruction for ranking, VLM validation on top candidates.
+- run_surrogate_assisted: mono-objectif (max L/D) with trust-region DE
+- run_nsga2_assisted: multi-objectif (Pareto front) with NSGA-II + AVL validation
 """
 
 import os
 import time
 import numpy as np
-from scipy.optimize import differential_evolution, OptimizeResult
+from scipy.optimize import differential_evolution
 from scipy.stats import qmc
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -157,147 +155,8 @@ def _evaluate_batch_sequential(
 
 
 # ---------------------------------------------------------------------------
-# Single-objective: Differential Evolution (Neuronautics approach)
+# Surrogate-assisted optimization (mono-objectif)
 # ---------------------------------------------------------------------------
-
-_eval_counter = [0]
-
-def _objective_de(x: np.ndarray, evaluator: AeroEvaluator, history: list) -> float:
-    """Objective for Differential Evolution: minimize -L/D + penalty."""
-    params = params_from_vector(x)
-    result = evaluator.evaluate(params)
-
-    score = -result["L_over_D"] + result["penalty"] * 10.0
-
-    history.append({
-        "params": params,
-        "result": result,
-        "score": score,
-    })
-
-    _eval_counter[0] += 1
-    n = _eval_counter[0]
-    if n % 20 == 0 or n <= 3:
-        ld = result["L_over_D"]
-        feas = "OK" if result["is_feasible"] else "X"
-        print(f"  eval #{n:4d}  L/D={ld:6.2f} [{feas}]", flush=True)
-
-    return score
-
-
-def run_differential_evolution(
-    mission: MissionCondition | None = None,
-    feasibility: FeasibilityConfig | None = None,
-    maxiter: int = 100,
-    popsize: int = 30,
-    tol: float = 1e-3,
-    seed: int = 42,
-    verbose: bool = True,
-) -> dict:
-    """Run Differential Evolution optimization (Neuronautics-style).
-
-    Single objective: maximize L/D with penalty constraints.
-    """
-    mission = mission or MissionCondition()
-    evaluator = AeroEvaluator(mission, feasibility=feasibility)
-    history = []
-    bounds = get_scipy_bounds()
-
-    rng = np.random.default_rng(seed)
-    lb, ub = get_bounds_arrays()
-    init_pop = rng.uniform(lb, ub, size=(popsize, N_VARS))
-
-    _eval_counter[0] = 0
-
-    if verbose:
-        print(f"Starting Differential Evolution: pop={popsize}, "
-              f"maxiter={maxiter}, vars={N_VARS}")
-        print(f"Mission: V={mission.velocity}m/s, MTOW={mission.mtow}kg, "
-              f"alt={mission.altitude}m")
-        print(f"Total evals estimate: ~{popsize * maxiter}")
-        print(flush=True)
-
-    gen_count = [0]
-    best_ld = [0.0]
-
-    def callback(xk, convergence):
-        gen_count[0] += 1
-        p = params_from_vector(xk)
-        r = evaluator.evaluate(p)
-        ld = r["L_over_D"]
-        feasible = r["is_feasible"]
-        if ld > best_ld[0] and feasible:
-            best_ld[0] = ld
-        if verbose:
-            print(f"  Gen {gen_count[0]:3d}/{maxiter} | "
-                  f"L/D={ld:.2f} {'OK' if feasible else 'X ':>2s} | "
-                  f"best={best_ld[0]:.2f} | conv={convergence:.4f}",
-                  flush=True)
-
-    result: OptimizeResult = differential_evolution(
-        _objective_de,
-        bounds=bounds,
-        args=(evaluator, history),
-        strategy="best1bin",
-        maxiter=maxiter,
-        popsize=popsize,
-        tol=tol,
-        seed=seed,
-        callback=callback,
-        polish=False,
-        init=init_pop,
-        mutation=(0.5, 1.0),
-        recombination=0.8,
-    )
-
-    best_params = params_from_vector(result.x)
-    best_result = evaluator.evaluate(best_params)
-
-    if verbose:
-        print(f"\n=== Optimization Complete ===")
-        print(f"Evaluations: {result.nfev}")
-        print(f"Converged: {result.success} ({result.message})")
-        print(f"\nBest design:")
-        print(f"  L/D      = {best_result['L_over_D']:.2f}")
-        print(f"  CL       = {best_result['CL']:.4f}")
-        print(f"  CD       = {best_result['CD']:.5f} "
-              f"(CD0={best_result['CD0']:.5f} + CDi={best_result['CDi']:.5f})")
-        print(f"  CM       = {best_result['CM']:.4f}")
-        print(f"  alpha    = {best_result['alpha_eq']:.2f} deg")
-        print(f"  SM       = {best_result['static_margin']:.3f}")
-        print(f"  AR       = {best_result['AR']:.1f}")
-        print(f"  Oswald e = {best_result['oswald_e']:.3f}")
-        print(f"  S_ref    = {best_result['S_ref']:.4f} m^2")
-        print(f"  Mass     = {best_result['struct_mass']:.3f} kg")
-        print(f"  Span     = {2*best_params.half_span:.2f} m")
-        print(f"  Root c   = {best_params.root_chord:.3f} m")
-        print(f"  Taper    = {best_params.taper_ratio:.3f}")
-        print(f"  Sweep    = {best_params.le_sweep_deg:.1f} deg")
-        print(f"  Feasible = {best_result['is_feasible']}")
-
-    return {
-        "best_params": best_params,
-        "best_result": best_result,
-        "scipy_result": result,
-        "history": history,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Surrogate-assisted optimization
-# ---------------------------------------------------------------------------
-
-def _surrogate_objective(
-    x: np.ndarray,
-    surrogate: SurrogateModel,
-    feasibility: FeasibilityConfig,
-    mission: MissionCondition,
-) -> float:
-    """Objective for DE on surrogate: predict primitives -> reconstruct -> penalize."""
-    prim = surrogate.predict(x)
-    result = reconstruct_aero(prim, x, mission, feasibility)
-    return -result["L_over_D"] + result["penalty"] * 10.0
-
 
 def _surrogate_objective_vectorized(
     X: np.ndarray,
@@ -537,24 +396,44 @@ def run_surrogate_assisted(
 
 
 # ---------------------------------------------------------------------------
-# Multi-objective: NSGA-II via pymoo
+# Multi-objective: NSGA-II surrogate-assisted with AVL validation
 # ---------------------------------------------------------------------------
 
-def run_nsga2(
+AVAILABLE_OBJECTIVES = {
+    "L_over_D":      {"key": "L_over_D",      "sense": "max", "label": "L/D"},
+    "struct_mass":   {"key": "struct_mass",    "sense": "min", "label": "Structural mass [kg]"},
+    "endurance_min": {"key": "endurance_min",  "sense": "max", "label": "Endurance [min]"},
+    "manuf_score":   {"key": "manufacturability_score", "sense": "max", "label": "Manufacturability"},
+    "range_km":      {"key": "range_km",       "sense": "max", "label": "Range [km]"},
+    "drag_force":    {"key": "drag_force",     "sense": "min", "label": "Drag [N]"},
+}
+
+
+def run_nsga2_assisted(
     mission: MissionCondition | None = None,
     feasibility: FeasibilityConfig | None = None,
     surrogate_path: str = "models/surrogate_v2_ctrl",
+    objectives: tuple[str, ...] = ("L_over_D", "struct_mass"),
     n_gen: int = 200,
     pop_size: int = 100,
+    n_validate: int = 50,
+    n_workers: int = 8,
     seed: int = 42,
     verbose: bool = True,
 ) -> dict:
-    """Multi-objective optimization using NSGA-II on surrogate.
+    """Multi-objective NSGA-II on surrogate + AVL validation of Pareto front.
 
-    Objectives: minimize [-L/D, struct_mass] (bi-objective)
-    Constraints: all FeasibilityConfig constraints (penalty <= 0)
+    Phase 1: NSGA-II on surrogate (fast, ~20k evals in seconds)
+    Phase 2: Select top-K designs from Pareto front
+    Phase 3: Validate with AVL (parallel)
+    Phase 4: Build validated Pareto front + identify best per objective & knee
 
-    Returns dict with 'pareto_X', 'pareto_F', 'pareto_results', 'pymoo_result'.
+    Parameters
+    ----------
+    objectives : tuple of str
+        Keys from AVAILABLE_OBJECTIVES (e.g. ("L_over_D", "struct_mass")).
+    n_validate : int
+        Number of Pareto designs to validate with AVL. 0 = skip validation.
     """
     from pymoo.core.problem import ElementwiseProblem
     from pymoo.algorithms.moo.nsga2 import NSGA2
@@ -568,33 +447,47 @@ def run_nsga2(
     surrogate = SurrogateModel.load(surrogate_path)
     lb, ub = get_bounds_arrays()
 
+    # Validate objectives
+    obj_defs = []
+    for obj_name in objectives:
+        if obj_name not in AVAILABLE_OBJECTIVES:
+            raise ValueError(f"Unknown objective '{obj_name}'. "
+                             f"Available: {list(AVAILABLE_OBJECTIVES.keys())}")
+        obj_defs.append(AVAILABLE_OBJECTIVES[obj_name])
+
+    n_obj = len(obj_defs)
+    obj_labels = [d["label"] for d in obj_defs]
+
     if verbose:
         print(f"=== NSGA-II Multi-Objective Optimization ===")
-        print(f"Objectives: minimize [-L/D, struct_mass]")
-        print(f"Constraints: penalty <= 0 (all feasibility constraints)")
+        print(f"Objectives ({n_obj}): {', '.join(obj_labels)}")
         print(f"Population: {pop_size}, Generations: {n_gen}")
+        print(f"AVL validation: {n_validate} designs")
+        print(f"Surrogate: {surrogate.architecture_str}, {surrogate.n_ensemble} ensemble")
+        print(flush=True)
 
+    # --- Phase 1: NSGA-II on surrogate ---
     class BWBProblem(ElementwiseProblem):
         def __init__(self):
             super().__init__(
-                n_var=N_VARS,
-                n_obj=2,
-                n_ieq_constr=1,
-                xl=lb,
-                xu=ub,
+                n_var=N_VARS, n_obj=n_obj, n_ieq_constr=1,
+                xl=lb, xu=ub,
             )
 
         def _evaluate(self, x, out, *args, **kwargs):
             prim = surrogate.predict(x)
             r = reconstruct_aero(prim, x, mission, feasibility)
+            f = []
+            for d in obj_defs:
+                val = r[d["key"]]
+                f.append(-val if d["sense"] == "max" else val)
+            out["F"] = f
+            out["G"] = [r["penalty"] - 0.01]
 
-            # Objectives: minimize both
-            out["F"] = [-r["L_over_D"], r["struct_mass"]]
-            # Constraint: penalty <= 0 means feasible
-            out["G"] = [r["penalty"] - 0.01]  # small tolerance
+    if verbose:
+        print("Phase 1: Running NSGA-II on surrogate...", flush=True)
 
-    problem = BWBProblem()
-
+    t0 = time.time()
     algorithm = NSGA2(
         pop_size=pop_size,
         sampling=FloatRandomSampling(),
@@ -602,65 +495,145 @@ def run_nsga2(
         mutation=PM(eta=20),
         eliminate_duplicates=True,
     )
-
     res = pymoo_minimize(
-        problem, algorithm,
+        BWBProblem(), algorithm,
         termination=("n_gen", n_gen),
-        seed=seed,
-        verbose=verbose,
+        seed=seed, verbose=False,
     )
+    t_surr = time.time() - t0
 
-    # Extract Pareto front
-    pareto_X = res.X  # (n_pareto, 30)
-    pareto_F = res.F  # (n_pareto, 2) = [-L/D, mass]
+    pareto_X = res.X
+    pareto_F = res.F
+    n_pareto = len(pareto_X) if pareto_X is not None else 0
 
-    # Reconstruct full results for Pareto designs
-    pareto_results = []
-    if pareto_X is not None:
-        for x in pareto_X:
-            prim = surrogate.predict(x)
-            r = reconstruct_aero(prim, x, mission, feasibility)
-            # Convert arrays to scalars
-            r_scalar = {k: (float(v) if hasattr(v, '__len__') and len(v) > 0 else float(v))
-                        for k, v in r.items()
-                        if not isinstance(v, (bool, np.bool_))}
-            r_scalar["is_feasible"] = bool(r.get("is_feasible", False))
-            r_scalar["duct_fits"] = bool(r.get("duct_fits", False))
-            pareto_results.append(r_scalar)
+    if verbose:
+        print(f"  Surrogate Pareto: {n_pareto} designs in {t_surr:.1f}s")
+        if pareto_F is not None:
+            for i, d in enumerate(obj_defs):
+                vals = -pareto_F[:, i] if d["sense"] == "max" else pareto_F[:, i]
+                print(f"    {d['label']:>25}: [{vals.min():.3f}, {vals.max():.3f}]")
 
-    n_feasible = sum(1 for r in pareto_results if r.get("is_feasible", False))
+    if n_pareto == 0:
+        if verbose:
+            print("  No Pareto solutions found!")
+        return {"pareto_X": None, "pareto_F": None,
+                "avl_results": [], "best_per_objective": {},
+                "objectives": objectives, "obj_defs": obj_defs,
+                "n_pareto": 0, "n_feasible": 0}
 
-    if verbose and pareto_X is not None:
-        print(f"\nPareto front: {len(pareto_X)} solutions ({n_feasible} feasible)")
-        # Best L/D on Pareto front
-        ld_vals = [-f[0] for f in pareto_F]
-        mass_vals = [f[1] for f in pareto_F]
-        print(f"  L/D range:  [{min(ld_vals):.2f}, {max(ld_vals):.2f}]")
-        print(f"  Mass range: [{min(mass_vals)*1000:.0f}, {max(mass_vals)*1000:.0f}] g")
+    # --- Phase 2: Select top-K for AVL validation ---
+    if n_validate <= 0:
+        if verbose:
+            print("Skipping AVL validation (n_validate=0)")
+        return {"pareto_X": pareto_X, "pareto_F": pareto_F,
+                "avl_results": [], "best_per_objective": {},
+                "objectives": objectives, "obj_defs": obj_defs,
+                "n_pareto": n_pareto, "n_feasible": 0, "pymoo_result": res}
+
+    if n_validate >= n_pareto:
+        validate_idx = np.arange(n_pareto)
+    else:
+        validate_idx = set()
+        for i in range(n_obj):
+            validate_idx.add(int(np.argmin(pareto_F[:, i])))
+        remaining = n_validate - len(validate_idx)
+        if remaining > 0:
+            step = max(1, n_pareto // remaining)
+            for j in range(0, n_pareto, step):
+                validate_idx.add(j)
+                if len(validate_idx) >= n_validate:
+                    break
+        validate_idx = np.array(sorted(validate_idx))
+
+    pareto_sample = pareto_X[validate_idx]
+
+    # Enrich with generate_candidates: combine features of best Pareto designs
+    # to explore beyond the surrogate's Pareto front
+    n_enriched = max(5, n_validate // 3)
+    surr_feasible = np.array([
+        reconstruct_aero(surrogate.predict(x), x, mission, feasibility)["penalty"] < 0.01
+        for x in pareto_sample
+    ])
+    enriched = generate_candidates(
+        top_k=pareto_sample,
+        n_candidates=n_enriched,
+        bounds=(lb, ub),
+        rng=np.random.default_rng(seed + 1),
+        feasible_mask=surr_feasible if surr_feasible.any() and not surr_feasible.all() else None,
+    )
+    X_validate = np.vstack([pareto_sample, enriched])
+    n_val = len(X_validate)
+
+    if verbose:
+        print(f"\nPhase 2: Validating {len(pareto_sample)} Pareto + "
+              f"{n_enriched} enriched = {n_val} designs with AVL...")
+
+    # --- Phase 3: AVL validation (parallel) ---
+    avl_results = _evaluate_batch(X_validate, mission, feasibility,
+                                  verbose=verbose, n_workers=n_workers)
+
+    # --- Phase 4: Build validated Pareto front ---
+    avl_F = np.zeros((n_val, n_obj))
+    for i, r in enumerate(avl_results):
+        for j, d in enumerate(obj_defs):
+            val = r.get(d["key"], 0.0)
+            avl_F[i, j] = -val if d["sense"] == "max" else val
+
+    feasible_mask = np.array([r.get("is_feasible", False) for r in avl_results])
+    n_feasible = int(feasible_mask.sum())
+
+    best_per_objective = {}
+    if n_feasible > 0:
+        feas_idx = np.where(feasible_mask)[0]
+        for j, (obj_name, d) in enumerate(zip(objectives, obj_defs)):
+            feas_vals = avl_F[feas_idx, j]
+            best_local = feas_idx[np.argmin(feas_vals)]
+            best_per_objective[obj_name] = {
+                "x": X_validate[best_local],
+                "result": avl_results[best_local],
+                "index": int(best_local),
+            }
+
+        # Knee point: closest to utopia (normalized)
+        feas_F = avl_F[feas_idx]
+        f_min = feas_F.min(axis=0)
+        f_max = feas_F.max(axis=0)
+        f_range = np.maximum(f_max - f_min, 1e-10)
+        f_norm = (feas_F - f_min) / f_range
+        dist_to_utopia = np.linalg.norm(f_norm, axis=1)
+        knee_local = feas_idx[np.argmin(dist_to_utopia)]
+        best_per_objective["knee"] = {
+            "x": X_validate[knee_local],
+            "result": avl_results[knee_local],
+            "index": int(knee_local),
+        }
+
+    if verbose:
+        print(f"\n=== Results ===")
+        print(f"Pareto (surrogate): {n_pareto} designs")
+        print(f"Validated (AVL):    {n_val} designs")
+        print(f"Feasible (AVL):     {n_feasible}")
+        if n_feasible > 0:
+            print(f"\nBest per objective (feasible):")
+            for name, info in best_per_objective.items():
+                r = info["result"]
+                parts = []
+                for obj_name, d in zip(objectives, obj_defs):
+                    parts.append(f"{d['label']}={r.get(d['key'], 0):.3f}")
+                print(f"  {name:>15}: {', '.join(parts)}")
 
     return {
         "pareto_X": pareto_X,
         "pareto_F": pareto_F,
-        "pareto_results": pareto_results,
-        "pymoo_result": res,
-        "n_pareto": len(pareto_X) if pareto_X is not None else 0,
+        "validate_idx": validate_idx,
+        "avl_X": X_validate,
+        "avl_F": avl_F,
+        "avl_results": avl_results,
+        "avl_feasible_mask": feasible_mask,
+        "best_per_objective": best_per_objective,
+        "objectives": objectives,
+        "obj_defs": obj_defs,
+        "n_pareto": n_pareto,
         "n_feasible": n_feasible,
+        "pymoo_result": res,
     }
-
-
-# Default entry point
-def run_optimization(
-    mission: MissionCondition | None = None,
-    feasibility: FeasibilityConfig | None = None,
-    method: str = "de",
-    **kwargs,
-) -> dict:
-    """Run optimization with specified method ('de', 'surrogate', or 'nsga2')."""
-    if method == "de":
-        return run_differential_evolution(mission=mission, feasibility=feasibility, **kwargs)
-    elif method == "surrogate":
-        return run_surrogate_assisted(mission=mission, feasibility=feasibility, **kwargs)
-    elif method == "nsga2":
-        return run_nsga2(mission=mission, feasibility=feasibility, **kwargs)
-    else:
-        raise ValueError(f"Unknown method: {method}. Use 'de', 'surrogate', or 'nsga2'.")

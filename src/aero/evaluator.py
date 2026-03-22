@@ -224,9 +224,15 @@ class AeroEvaluator:
                                        mission.edf, mission.battery)
         endurance_s = prop["endurance_s"]
 
-        # Duct fit constraint
+        # Duct fit constraint (adaptive placement + station-by-station clearance)
         body_chord = params.body_root_chord
-        duct_ok = duct_fits_in_body(params.body_tc_root, body_chord, mission.edf)
+        from ..propulsion.duct_geometry import compute_duct_placement, validate_duct_clearance
+        placement = compute_duct_placement(params, mission.edf)
+        _duct_ok, _clr = validate_duct_clearance(placement, params, min_clearance_mm=0.0)
+        min_duct_clearance_mm = min(
+            min(r.clearance_top_mm, r.clearance_bot_mm) for r in _clr
+        ) if _clr else 0.0
+        duct_ok = min_duct_clearance_mm >= 0.0
 
         # Manufacturability score (geometry-only, no AVL needed)
         manuf = compute_manufacturability(params)
@@ -302,6 +308,7 @@ class AeroEvaluator:
             "endurance_min": prop["endurance_min"],
             "range_km": prop["range_km"],
             "duct_fits": duct_ok,
+            "min_duct_clearance_mm": min_duct_clearance_mm,
             "CD_intake": cd_intake,
             # Feasibility
             "is_feasible": is_feasible,

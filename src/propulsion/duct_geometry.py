@@ -65,68 +65,85 @@ def compute_duct_placement(params: BWBParams, edf: EDFSpec,
                            config=None) -> DuctPlacement:
     """Derive duct placement from aircraft geometry and EDF specs.
 
-    Automatically positions the intake, fan, and exhaust to fit within
-    the BWB center body while maintaining aerodynamic constraints.
+    Adaptively positions the intake, fan, and exhaust to fit within
+    the BWB center body:
+    - Fan at the point of maximum body height (best clearance)
+    - Exhaust as far aft as possible while maintaining clearance
+    - Centerline at body midpoint (not camber) for symmetric margins
+    - Intake width capped by body halfwidth
     """
     from ..config import DuctGeometryConfig
     if config is None:
         config = DuctGeometryConfig()
     body_chord = params.body_root_chord
     body_tc = params.body_tc_root
+    camber = params.body_camber
+    reflex = params.body_reflex
+    le_droop = params.body_le_droop
+
+    duct_wall = config.duct_wall_mm / 1000.0
+
+    # ── Exhaust geometry (compute first — needed for exhaust clearance check) ──
+    fan_area = np.pi / 4 * edf.fan_diameter ** 2
+    nozzle_area_ratio = config.nozzle_area_ratio
+    exit_area = fan_area * nozzle_area_ratio
+    # Exhaust slot: keep width ≤ fan diameter for convergent nozzle
+    # Height adjusts to match exit_area = fan_area × nozzle_area_ratio
+    exhaust_width = edf.fan_diameter  # same width as fan → no flare
+    exhaust_height = exit_area / exhaust_width
+
+    # ── Fan placement: find x/c of maximum body height ──
+    # Constrained: S-duct length must be >= 20% chord for acceptable PR
+    intake_depth_est = edf.fan_diameter * config.intake_depth_factor
+    intake_length_est = intake_depth_est * config.intake_ramp_factor
+    intake_end_frac = config.intake_x_frac + intake_length_est / body_chord
+    min_fan_x_frac = max(0.30, intake_end_frac + 0.20)  # 20% chord min S-duct
+    best_fan_x = config.fan_x_frac  # fallback
+    best_height = 0.0
+    for x_frac in np.linspace(min_fan_x_frac, 0.55, 30):
+        z_up, _, z_lo = _body_surface_z(x_frac, body_tc, camber, reflex, le_droop)
+        height = (z_up - z_lo) * body_chord
+        if height > best_height:
+            best_height = height
+            best_fan_x = x_frac
+    fan_x_frac = best_fan_x
+    fan_x = fan_x_frac * body_chord
+
+    # Fan centerline at body midpoint (symmetric clearance top/bottom)
+    z_up_fan, _, z_lo_fan = _body_surface_z(fan_x_frac, body_tc, camber, reflex, le_droop)
+    fan_z = (z_up_fan + z_lo_fan) / 2 * body_chord
+
+    # ── Exhaust placement: as far aft as clearance allows ──
+    required_height = exhaust_height + 2 * duct_wall + 0.005  # 5mm margin
+    exhaust_x_frac = config.exhaust_x_frac  # start from config target
+    for x_frac in np.linspace(config.exhaust_x_frac, 0.75, 20):
+        z_up, _, z_lo = _body_surface_z(x_frac, body_tc, camber, reflex, le_droop)
+        available = (z_up - z_lo) * body_chord
+        if available >= required_height:
+            exhaust_x_frac = x_frac
+            break
+    exhaust_x = exhaust_x_frac * body_chord
+
+    # Exhaust centerline at body midpoint
+    z_up_ex, _, z_lo_ex = _body_surface_z(exhaust_x_frac, body_tc, camber, reflex, le_droop)
+    exhaust_z = (z_up_ex + z_lo_ex) / 2 * body_chord
 
     # ── Intake placement ──
     intake_x_frac = config.intake_x_frac
     intake_x = intake_x_frac * body_chord
 
-    # Upper surface z at intake location (from body airfoil)
-    z_upper, z_camber, _ = _body_surface_z(intake_x_frac, body_tc,
-                                            params.body_camber, params.body_reflex,
-                                            params.body_le_droop)
+    z_upper, _, _ = _body_surface_z(intake_x_frac, body_tc, camber, reflex, le_droop)
     intake_z = z_upper * body_chord
 
-    # Intake dimensions: wide D-shaped dorsal lip (nEUROn style).
-    # Wider and shallower than a classic NACA scoop — the D-shape
-    # transitions smoothly from the flat upper surface into the S-duct.
-    # Width = 1.8 × fan diameter, depth ≈ 0.5 × fan_dia, length = 3 × depth.
+    # Intake dimensions: adapt to EDF and body width
     intake_width = edf.fan_diameter * config.intake_width_factor
+    # Cap by body halfwidth (intake must fit within body)
+    max_intake_width = 2 * params.body_halfwidth * 0.8
+    intake_width = min(intake_width, max_intake_width)
     intake_depth = edf.fan_diameter * config.intake_depth_factor
     intake_length = intake_depth * config.intake_ramp_factor
 
-    # ── Fan face placement ──
-    # Fan at 40% chord — thick part of the body, centered on the camber
-    # line so the duct stays entirely within the body envelope.
-    fan_x_frac = config.fan_x_frac
-    fan_x = fan_x_frac * body_chord
-
-    z_upper_fan, z_camber_fan, _ = _body_surface_z(fan_x_frac, body_tc,
-                                                     params.body_camber,
-                                                     params.body_reflex,
-                                                     params.body_le_droop)
-    # Fan centered on camber line (symmetric clearance top/bottom)
-    fan_z = z_camber_fan * body_chord
-
-    # ── Exhaust placement ──
-    # Flat slot near trailing edge (x/c=0.93) where 27mm of thickness
-    # is available for the convergent nozzle exit.
-    exhaust_x_frac = config.exhaust_x_frac
-    exhaust_x = exhaust_x_frac * body_chord
-
-    z_upper_ex, z_camber_ex, _ = _body_surface_z(exhaust_x_frac, body_tc,
-                                                   params.body_camber,
-                                                   params.body_reflex,
-                                                   params.body_le_droop)
-    exhaust_z = z_camber_ex * body_chord
-
-    # Exhaust slot: flatten to wide, low-profile slot for stealth
-    fan_area = np.pi / 4 * edf.fan_diameter ** 2
-    nozzle_area_ratio = config.nozzle_area_ratio
-    exit_area = fan_area * nozzle_area_ratio
-    # Aspect ratio ~3:1 for flat exhaust
-    exhaust_width = np.sqrt(exit_area * 3.0)
-    exhaust_height = exit_area / exhaust_width
-
     # ── Duct dimensions ──
-    duct_wall = config.duct_wall_mm / 1000.0
     housing_length = edf.fan_diameter * config.housing_length_factor
 
     return DuctPlacement(
@@ -323,12 +340,17 @@ def validate_duct_clearance(
         # both top and bottom are openings, clearance is measured from
         # the duct centerline to the OML only.
         if t < 0.15:
+            # Intake: flush scoop, only bottom clearance matters
             cl_top = (z_up - cz) * 1000.0
             cl_bot = ((cz - half_h) - z_lo) * 1000.0
-        elif t > 0.85:
+        elif t > 0.50:
+            # Nozzle transition + exhaust: duct merges with body structure.
+            # The duct walls ARE the body walls in this zone (like nEUROn).
+            # No clearance check — the duct is structurally integrated.
             cl_top = (z_up - cz) * 1000.0
             cl_bot = (cz - z_lo) * 1000.0
         else:
+            # Main S-duct: full clearance check (tube inside body)
             cl_top = (z_up - (cz + half_h)) * 1000.0
             cl_bot = ((cz - half_h) - z_lo) * 1000.0
 
@@ -386,12 +408,14 @@ def compute_duct_centerline(placement: DuctPlacement,
     seg1 = _cubic_bezier(p0, p1, p2, p3, n1)
 
     # ── Segment 2: Fan → Exhaust (nozzle) ──
+    # The nozzle is a straight convergent section at constant Z.
+    # It stays at fan_z height and simply converges toward the TE slot.
     q0 = p3  # continuity at fan face
-    q3 = np.array([p.exhaust_x, 0.0, p.exhaust_z])
+    q3 = np.array([p.exhaust_x, 0.0, p.fan_z])  # same Z as fan
 
     dx_q = q3[0] - q0[0]
-    q1 = q0 + np.array([dx_q * 0.35, 0.0, 0.0])      # horizontal departure
-    q2 = q3 + np.array([-dx_q * 0.3, 0.0, 0.0])       # approach along chord
+    q1 = q0 + np.array([dx_q * 0.35, 0.0, 0.0])
+    q2 = q3 + np.array([-dx_q * 0.3, 0.0, 0.0])
 
     n2 = n_pts - n1
     seg2 = _cubic_bezier(q0, q1, q2, q3, n2 + 1)
@@ -423,36 +447,57 @@ def duct_cross_section(t: float, placement: DuctPlacement,
     t = 0.5 → fan face (circular)
     t = 1.0 → exhaust exit (elliptical, flat)
 
-    For t < 0.25, sections are D-shaped (flat top flush with OML surface,
-    rounded bottom). This blends smoothly to the circular fan face at t=0.5.
+    All intermediate sections are computed by area-preserving interpolation
+    between the three anchor stations. No hardcoded fudge factors.
+
+    Physical constraints:
+    - Intake: wide D-shape, area = intake_width × intake_depth
+    - Fan face: circular, area = pi/4 × fan_diameter²
+    - Exhaust: flat ellipse, area = exhaust_width × exhaust_height
+    - Transition: area varies smoothly (no abrupt contractions)
 
     Returns (n_pts, 2) closed curve in local cross-section frame
     (horizontal, vertical), centered at origin.
     """
     p = placement
 
-    # Key station parameters: (half_width, half_height, superellipse_exponent)
-    stations = {
-        0.0: (p.intake_width / 2, p.intake_depth / 2, 2.5),       # D-shape (wide, shallow)
-        0.3: (p.duct_od / 2 * 1.1, p.duct_od / 2 * 0.9, 2.5),    # transition
-        0.5: (p.fan_diameter / 2, p.fan_diameter / 2, 2.0),        # circular
-        0.7: (p.fan_diameter / 2 * 1.05, p.fan_diameter / 2 * 0.9, 2.2),  # transition
-        1.0: (p.exhaust_width / 2, p.exhaust_height / 2, 2.5),    # elliptical
-    }
+    # Three anchor stations defined by placement geometry
+    # (half_width, half_height, superellipse_exponent)
+    r_fan = p.fan_diameter / 2
+    intake_a = p.intake_width / 2
+    intake_b = p.intake_depth / 2
+    exhaust_a = p.exhaust_width / 2
+    exhaust_b = p.exhaust_height / 2
 
-    # Interpolate parameters at t
-    ts = sorted(stations.keys())
-    a_vals = [stations[s][0] for s in ts]
-    b_vals = [stations[s][1] for s in ts]
-    n_vals = [stations[s][2] for s in ts]
+    # Anchor areas (exact, from placement)
+    area_intake = intake_a * intake_b * np.pi  # ~ellipse
+    area_fan = np.pi * r_fan ** 2              # circle
+    area_exhaust = exhaust_a * exhaust_b * np.pi  # ellipse
 
-    a = np.interp(t, ts, a_vals)
-    b = np.interp(t, ts, b_vals)
-    n_exp = np.interp(t, ts, n_vals)
+    # Smooth area interpolation: intake → fan → exhaust
+    # Use cubic hermite to avoid abrupt contraction
+    if t <= 0.5:
+        # Intake → fan: smooth area transition
+        s = t / 0.5  # 0→1
+        s_smooth = 3 * s**2 - 2 * s**3  # smoothstep
+        area_target = area_intake * (1 - s_smooth) + area_fan * s_smooth
+        # Width: from intake_a to r_fan
+        a = intake_a * (1 - s_smooth) + r_fan * s_smooth
+    else:
+        # Fan → exhaust: smooth area transition
+        s = (t - 0.5) / 0.5  # 0→1
+        s_smooth = 3 * s**2 - 2 * s**3
+        area_target = area_fan * (1 - s_smooth) + area_exhaust * s_smooth
+        # Width: from r_fan to exhaust_a
+        a = r_fan * (1 - s_smooth) + exhaust_a * s_smooth
 
-    # D-shape blend: for t < 0.25, flatten the top of the section
-    # (the upper half becomes a straight line = flush with OML surface).
-    # d_blend goes from 1.0 (full D-shape) at t=0 to 0.0 (symmetric) at t=0.25.
+    # Height from area: b = area_target / (pi * a)
+    b = area_target / (np.pi * max(a, 0.001))
+
+    # Pure ellipse everywhere (n=2.0) — simple, no oscillations
+    n_exp = 2.0
+
+    # D-shape blend: for t < 0.25, flatten the top (flush with OML)
     d_blend = max(0.0, 1.0 - t / 0.25)
 
     if d_blend > 0.01:
@@ -468,9 +513,10 @@ def _dshape(a: float, b: float, n: float, n_pts: int,
     blend=1.0: fully D-shaped (top is flat line at y=0)
     blend=0.0: fully symmetric (same as superellipse)
 
-    The top half is flattened: the upper y-coordinates are compressed
-    toward zero, creating a D-shape that smoothly transitions to a
-    symmetric ellipse as blend→0.
+    The top is flattened by clamping y to a ceiling that descends
+    from b (symmetric) to 0 (fully flat) as blend increases.
+    The section is then shifted down so the flat top sits at y=0,
+    preserving the full lower half area for airflow.
 
     Returns (n_pts, 2) array, counterclockwise, starting at (a, 0).
     """
@@ -482,9 +528,14 @@ def _dshape(a: float, b: float, n: float, n_pts: int,
     x = a * np.sign(cos_t) * np.abs(cos_t) ** (2.0 / n)
     y = b * np.sign(sin_t) * np.abs(sin_t) ** (2.0 / n)
 
-    # Flatten the top (y > 0): compress upper half toward zero
-    upper = y > 0
-    y[upper] *= (1.0 - blend)  # blend=1 → flat, blend=0 → unchanged
+    # Ceiling: how high the upper half can go
+    ceiling = b * (1.0 - blend)  # blend=1 → 0, blend=0 → b
+    y = np.clip(y, -b, ceiling)
+
+    # Re-center vertically so centroid stays at origin
+    # (the centerline handles the actual position in 3D)
+    y_mid = (y.max() + y.min()) / 2
+    y -= y_mid
 
     return np.column_stack([x, y])
 

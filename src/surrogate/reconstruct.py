@@ -289,7 +289,12 @@ def reconstruct_aero(
         x_cg_real = _fast_cg(x, mission, cg_config)
         manuf_score = _fast_manufacturability(x)
         vs = None  # computed below
-    duct_fits_arr = _fast_duct_fits(x, mission.edf)
+    # Duct clearance: use predicted if available, else fast check
+    if "min_duct_clearance_mm" in primitives:
+        min_clr = np.atleast_1d(np.asarray(primitives["min_duct_clearance_mm"], dtype=float))
+        duct_fits_arr = min_clr >= 0.0
+    else:
+        duct_fits_arr = _fast_duct_fits(x, mission.edf)
 
     # CL_required for level flight
     q = mission.dynamic_pressure

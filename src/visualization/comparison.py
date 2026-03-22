@@ -61,6 +61,14 @@ def plot_pareto(catalog, obj_x: str = "manufacturability_score",
         names.append(entry.name)
         colors.append(color_map.get(entry.origin, "#757575"))
 
+    if not xs:
+        ax.text(0.5, 0.5, "No data: metrics not available\nfor the selected axes",
+                ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        ax.set_title("Design Trade-off Space (no data)", fontsize=13)
+        if save_path:
+            save_fig(plt.gcf(), save_path)
+        return plt.gcf()
+
     xs, ys = np.array(xs), np.array(ys)
 
     # Plot points
@@ -70,6 +78,9 @@ def plot_pareto(catalog, obj_x: str = "manufacturability_score",
                     xytext=(8, 5), fontsize=8, fontweight="bold")
 
     # Draw Pareto front (maximize both x and y)
+    if len(xs) == 1:
+        ax.text(0.5, 0.02, "Single design — Pareto front requires ≥ 2 designs",
+                ha='center', transform=ax.transAxes, fontsize=9, style='italic', alpha=0.6)
     if len(xs) > 1:
         order = np.argsort(xs)
         pareto_x, pareto_y = [xs[order[0]]], [ys[order[0]]]

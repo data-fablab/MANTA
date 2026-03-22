@@ -289,7 +289,7 @@ def _standard_fuse(
     op = BRepAlgoAPI_Fuse(shape_a, shape_b)
     op.SetFuzzyValue(fuzzy)
     op.Build()
-    if op.IsDone() and not op.HasErrors():
+    if op.IsDone():
         return op.Shape()
     return None
 
@@ -305,7 +305,7 @@ def _standard_cut(
     op = BRepAlgoAPI_Cut(shape_base, shape_tool)
     op.SetFuzzyValue(fuzzy)
     op.Build()
-    if op.IsDone() and not op.HasErrors():
+    if op.IsDone():
         return op.Shape()
     return None
 

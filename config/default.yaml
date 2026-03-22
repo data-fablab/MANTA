@@ -95,8 +95,8 @@ duct:
   intake_x_frac: 0.04            # intake at 4% body chord
   fan_x_frac: 0.40               # fan at 40% body chord
   exhaust_x_frac: 0.93           # exhaust at 93% body chord
-  intake_width_factor: 1.8       # × fan_diameter
-  intake_depth_factor: 0.5       # × fan_diameter
+  intake_width_factor: 2.5       # × fan_diameter (sized for 25 m/s mass flow)
+  intake_depth_factor: 0.7       # × fan_diameter
   intake_ramp_factor: 3.0        # × intake_depth
   nozzle_area_ratio: 0.80        # exhaust / fan area
   duct_wall_mm: 1.0              # [mm] composite wall thickness
@@ -114,7 +114,7 @@ duct_aero:
 
 # ── Structural mass model ──
 structure:
-  skin_density_kg_m2: 0.6        # [kg/m²] composite shell areal density
+  skin_density_kg_m2: 1.0        # [kg/m²] calibrated against 4-ply carbon layup
   structural_adder: 1.20         # +20% for ribs, adhesive, misc
   body_tc_correction: 0.8        # body t/c correction factor
   gyration_radius_factor: 0.3    # k_yy for Iy estimation

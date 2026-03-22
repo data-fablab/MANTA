@@ -1092,10 +1092,7 @@ def _loft_duct_solid(sections_3d: list[np.ndarray]) -> 'TopoDS_Shape':
     from OCP.GeomAbs import GeomAbs_C2
     from OCP.Approx import Approx_ChordLength
 
-    loft = BRepOffsetAPI_ThruSections(True, False)  # solid=True, ruled=False
-    loft.SetMaxDegree(6)
-    loft.SetContinuity(GeomAbs_C2)
-    loft.SetParType(Approx_ChordLength)
+    loft = BRepOffsetAPI_ThruSections(True, True)  # solid=True, ruled=True
     loft.CheckCompatibility(True)
 
     for sec in sections_3d:
@@ -1169,44 +1166,50 @@ def _export_with_propulsion(params: BWBParams, path: str,
 
     import numpy as _np
 
+    # Build duct with fewer sections for clean ruled loft
     sduct_secs = build_sduct_geometry(placement, p, prop_edf,
-                                       n_stations=12, n_profile=n_duct_profile)
+                                       n_stations=6, n_profile=n_duct_profile)
     housing_secs = build_edf_housing(placement, prop_edf,
-                                       n_profile=n_duct_profile, n_axial=4)
+                                       n_profile=n_duct_profile, n_axial=3)
     exhaust_secs = build_exhaust_geometry(placement, p, prop_edf,
-                                            n_stations=8, n_profile=n_duct_profile)
+                                            n_stations=4, n_profile=n_duct_profile)
 
     all_duct_secs = sduct_secs + housing_secs[1:] + exhaust_secs[1:]
+    # Sort sections by X position to avoid loft twisting
+    all_duct_secs.sort(key=lambda s: s[:, 0].mean())
 
     duct_solid = None
     duct_path = None
     duct_kb = 0
     try:
         from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
         from OCP.gp import gp_Vec
 
-        # 1. Main duct loft (no extensions)
+        # 1. Main duct loft (ruled)
         main_duct = _loft_duct_solid(all_duct_secs)
 
-        # 2. Intake extension: extrude first section 60mm upstream (-X)
+        # 2. Extensions to pierce the OML for boolean Cut openings
+        # Length = body thickness at that station + margin, to fully traverse the body
+        body_thickness_mm = p.body_tc_root * p.body_root_chord * 1000
+        ext_len = body_thickness_mm + 50  # mm, generous margin to ensure clean cut
+
         first_wire = _make_closed_wire(all_duct_secs[0] * 1000.0)
-        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
         first_face = BRepBuilderAPI_MakeFace(first_wire, True).Face()
-        intake_prism = BRepPrimAPI_MakePrism(
-            first_face, gp_Vec(-200.0, 0.0, 0.0)  # 200mm in -X (mm)
+        intake_ext = BRepPrimAPI_MakePrism(
+            first_face, gp_Vec(-ext_len, 0.0, 0.0)
         ).Shape()
 
-        # 3. Exhaust extension: extrude last section 100mm downstream (+X)
         last_wire = _make_closed_wire(all_duct_secs[-1] * 1000.0)
         last_face = BRepBuilderAPI_MakeFace(last_wire, True).Face()
-        exhaust_prism = BRepPrimAPI_MakePrism(
-            last_face, gp_Vec(100.0, 0.0, 0.0)  # 100mm in +X (mm)
+        exhaust_ext = BRepPrimAPI_MakePrism(
+            last_face, gp_Vec(ext_len, 0.0, 0.0)
         ).Shape()
 
-        # 4. Fuse main + intake_ext + exhaust_ext
-        fuse1 = BRepAlgoAPI_Fuse(main_duct, intake_prism)
+        # 3. Fuse main + extensions
+        fuse1 = BRepAlgoAPI_Fuse(main_duct, intake_ext)
         fuse1.Build()
-        fuse2 = BRepAlgoAPI_Fuse(fuse1.Shape(), exhaust_prism)
+        fuse2 = BRepAlgoAPI_Fuse(fuse1.Shape(), exhaust_ext)
         fuse2.Build()
         duct_solid = fuse2.Shape()
         duct_path = path.replace('.step', '_duct_only.step')

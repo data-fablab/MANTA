@@ -28,6 +28,8 @@ PRIMITIVE_TARGETS = [
     # v4: geometry/constraint targets (replaces _fast_* approximations)
     "struct_mass", "internal_volume", "manufacturability_score",
     "x_cg_frac", "Vs",
+    # v5: duct clearance (adaptive placement)
+    "min_duct_clearance_mm",
 ]
 
 # Backward-compatible: the original 7 targets for loading legacy models
@@ -54,6 +56,7 @@ _TARGET_CLIP = {
     "manufacturability_score":  (0.0, 1.0),
     "x_cg_frac":                (0.2, 1.0),
     "Vs":                       (5.0, 25.0),
+    "min_duct_clearance_mm":    (-20.0, 50.0),
 }
 
 
@@ -174,6 +177,11 @@ class SurrogateModel:
                 if any(v is None for v in [struct_m, int_vol, manuf_s, xcg_f, vs_val]):
                     continue
                 row.extend([struct_m, int_vol, manuf_s, xcg_f, vs_val])
+            if self._n_targets >= 17:
+                clr_val = r.get("min_duct_clearance_mm", None)
+                if clr_val is None:
+                    continue
+                row.append(clr_val)
 
             Y_rows.append(row)
             valid_indices.append(i)

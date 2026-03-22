@@ -155,6 +155,9 @@ def clean_spines(ax, keep=None):
 
 
 def save_fig(fig, path, dpi=DPI_SAVE):
-    """Standardized figure saving with tight bounding box."""
+    """Standardized figure saving with tight bounding box.
+
+    Does NOT close the figure — in Jupyter inline mode, closing
+    before cell completion produces '<Figure with 0 Axes>'.
+    """
     fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
-    plt.close(fig)

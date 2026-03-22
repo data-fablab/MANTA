@@ -54,8 +54,10 @@ class MissionCondition:
             # Use default params for duct mass estimate (placement varies
             # little across the design space since duct dimensions come
             # from EDF spec, not wing geometry).
-            placement = compute_duct_placement(BWBParams(), self.edf)
-            return compute_duct_structure_mass(placement)
+            from ..config import duct_from_config, load_config
+            _duct_cfg = duct_from_config(load_config())
+            placement = compute_duct_placement(BWBParams(), self.edf, config=_duct_cfg)
+            return compute_duct_structure_mass(placement, config=_duct_cfg)
         except Exception:
             return 0.19  # fallback estimate for 70mm EDF
 

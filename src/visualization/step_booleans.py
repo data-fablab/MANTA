@@ -197,6 +197,15 @@ def validate_boolean_result(
                 % (vol_result, vol_a)
             )
 
+    elif operation == "common":
+        # Intersection volume should be ≤ min(vol_a, vol_b)
+        vol_min = min(vol_a, vol_b)
+        if vol_result > vol_min * (1 + volume_tolerance):
+            return False, (
+                "Common volume %.1f > min operand %.1f (volume inflation)"
+                % (vol_result, vol_min)
+            )
+
     return True, "OK (vol=%.1f mm³)" % vol_result
 
 
@@ -530,16 +539,135 @@ def robust_cut(
     return None, "all cut strategies failed"
 
 
+# ─── Intersection (Common) ─────────────────────────────────────────────
+
+def _cells_builder_common(
+    shape_a: TopoDS_Shape,
+    shape_b: TopoDS_Shape,
+    fuzzy: float = 0.01,
+) -> Optional[TopoDS_Shape]:
+    """Intersection via BOPAlgo_CellsBuilder — select cells in BOTH shapes."""
+    from OCP.BOPAlgo import BOPAlgo_CellsBuilder
+    from OCP.TopTools import TopTools_ListOfShape
+
+    cb = BOPAlgo_CellsBuilder()
+    cb.AddArgument(shape_a)
+    cb.AddArgument(shape_b)
+    cb.SetFuzzyValue(fuzzy)
+    cb.SetRunParallel(True)
+    cb.SetNonDestructive(True)
+
+    cb.Perform()
+    if cb.HasErrors():
+        return None
+
+    # Select cells that belong to BOTH operands
+    both = TopTools_ListOfShape()
+    both.Append(shape_a)
+    both.Append(shape_b)
+    empty = TopTools_ListOfShape()
+    cb.AddToResult(both, empty)
+    cb.MakeContainers()
+
+    result = cb.Shape()
+    return result if not result.IsNull() else None
+
+
+def _standard_common(
+    shape_a: TopoDS_Shape,
+    shape_b: TopoDS_Shape,
+    fuzzy: float = 0.01,
+) -> Optional[TopoDS_Shape]:
+    """Intersection via standard BRepAlgoAPI_Common."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+
+    op = BRepAlgoAPI_Common(shape_a, shape_b)
+    op.SetFuzzyValue(fuzzy)
+    op.Build()
+    if op.IsDone():
+        return op.Shape()
+    return None
+
+
+def robust_common(
+    shape_a: TopoDS_Shape,
+    shape_b: TopoDS_Shape,
+    preprocess_shapes: bool = True,
+    label: str = "common",
+) -> tuple[Optional[TopoDS_Shape], str]:
+    """Robust intersection with preprocessing and cascading fallbacks.
+
+    Returns the volume shared by both shapes (cells in A AND B).
+
+    Returns:
+        (result_shape, status_message)
+    """
+    if preprocess_shapes:
+        print("[%s] Preprocessing operands..." % label)
+        shape_a = preprocess(shape_a)
+        shape_b = preprocess(shape_b)
+
+    vol_a = compute_volume(shape_a)
+    vol_b = compute_volume(shape_b)
+    print("[%s] Operand volumes: %.1f, %.1f mm³" % (label, vol_a, vol_b))
+
+    # Strategy 1: CellsBuilder common
+    for fuzzy in FUZZY_VALUES:
+        print("[%s] Trying CellsBuilder common (fuzzy=%.3f)..." % (label, fuzzy))
+        try:
+            result = _cells_builder_common(shape_a, shape_b, fuzzy)
+            if result is not None:
+                ok, msg = validate_boolean_result(
+                    result, [vol_a, vol_b], "common"
+                )
+                if ok:
+                    result = heal_shape(result)
+                    print("[%s] CellsBuilder common OK: %s" % (label, msg))
+                    return result, "CellsBuilder common fuzzy=%.3f" % fuzzy
+                else:
+                    print("[%s] CellsBuilder common invalid: %s" % (label, msg))
+        except Exception as e:
+            print("[%s] CellsBuilder common error: %s" % (label, e))
+
+    # Strategy 2: Standard BRepAlgoAPI_Common
+    for fuzzy in FUZZY_VALUES:
+        print("[%s] Trying BRepAlgoAPI_Common (fuzzy=%.3f)..." % (label, fuzzy))
+        try:
+            result = _standard_common(shape_a, shape_b, fuzzy)
+            if result is not None:
+                ok, msg = validate_boolean_result(
+                    result, [vol_a, vol_b], "common"
+                )
+                if ok:
+                    result = heal_shape(result)
+                    print("[%s] Standard Common OK: %s" % (label, msg))
+                    return result, "BRepAlgoAPI_Common fuzzy=%.3f" % fuzzy
+                else:
+                    print("[%s] Standard Common invalid: %s" % (label, msg))
+        except Exception as e:
+            print("[%s] Standard Common error: %s" % (label, e))
+
+    return None, "all common strategies failed"
+
+
+# ─── Full pipeline ─────────────────────────────────────────────────────
+
 def robust_fuse_and_cut(
     oml_solid: TopoDS_Shape,
     shell_solid: TopoDS_Shape,
     duct_solid: TopoDS_Shape,
     label: str = "propulsion",
 ) -> tuple[Optional[TopoDS_Shape], str]:
-    """Complete propulsion integration: Fuse(OML, Shell) then Cut(Duct).
+    """Complete propulsion integration: Clip + Fuse(OML, Shell) + Cut(Duct).
 
-    This is the main entry point for the v3 pipeline. Preprocessing is
-    applied once at the start (not repeated per attempt).
+    Pipeline:
+    1. Preprocess all shapes
+    2. Clip duct and shell to OML envelope (Common/intersection)
+    3. Fuse OML + clipped shell
+    4. Cut clipped duct from fused result
+
+    The clip step ensures extensions don't protrude beyond the OML,
+    creating clean openings at intake and exhaust.
 
     Returns:
         (result_shape, status_message)
@@ -548,32 +676,50 @@ def robust_fuse_and_cut(
     print("[%s] Robust STEP boolean pipeline" % label)
     print("=" * 60)
 
-    # Preprocess all three shapes once
-    print("[%s] Step 1/3: Preprocessing all shapes..." % label)
+    # Step 1: Preprocess all three shapes once
+    print("[%s] Step 1/5: Preprocessing all shapes..." % label)
     oml_pp = preprocess(oml_solid)
     shell_pp = preprocess(shell_solid)
     duct_pp = preprocess(duct_solid)
 
-    # Step 2: Fuse OML + Shell
-    print("[%s] Step 2/3: Fuse(OML, Shell)..." % label)
+    # Step 2: Clip duct to OML envelope (intersection)
+    print("[%s] Step 2/5: Clip duct to OML (Common)..." % label)
+    clipped_duct, clip_duct_msg = robust_common(
+        duct_pp, oml_pp, preprocess_shapes=False, label="clip_duct"
+    )
+    if clipped_duct is None:
+        print("[%s] Duct clipping failed (%s), using unclipped" % (label, clip_duct_msg))
+        clipped_duct = duct_pp
+
+    # Step 3: Clip shell to OML envelope (intersection)
+    print("[%s] Step 3/5: Clip shell to OML (Common)..." % label)
+    clipped_shell, clip_shell_msg = robust_common(
+        shell_pp, oml_pp, preprocess_shapes=False, label="clip_shell"
+    )
+    if clipped_shell is None:
+        print("[%s] Shell clipping failed (%s), using unclipped" % (label, clip_shell_msg))
+        clipped_shell = shell_pp
+
+    # Step 4: Fuse OML + clipped shell
+    print("[%s] Step 4/5: Fuse(OML, clipped Shell)..." % label)
     fused, fuse_msg = robust_fuse(
-        oml_pp, shell_pp, preprocess_shapes=False, label="fuse"
+        oml_pp, clipped_shell, preprocess_shapes=False, label="fuse"
     )
     if fused is None:
         return None, "Fuse failed: %s" % fuse_msg
 
-    # Step 3: Cut duct from fused
-    print("[%s] Step 3/3: Cut(Fused, Duct)..." % label)
+    # Step 5: Cut clipped duct from fused
+    print("[%s] Step 5/5: Cut(Fused, clipped Duct)..." % label)
     result, cut_msg = robust_cut(
-        fused, duct_pp, preprocess_shapes=False, label="cut"
+        fused, clipped_duct, preprocess_shapes=False, label="cut"
     )
     if result is None:
         return None, "Cut failed after successful fuse: %s" % cut_msg
 
     vol = compute_volume(result)
     valid = is_valid_solid(result)
-    summary = "OK — Fuse: %s, Cut: %s, vol=%.1f cm³, valid=%s" % (
-        fuse_msg, cut_msg, vol / 1e6, valid,
+    summary = "OK — Clip: %s/%s, Fuse: %s, Cut: %s, vol=%.1f cm³, valid=%s" % (
+        clip_duct_msg, clip_shell_msg, fuse_msg, cut_msg, vol / 1e6, valid,
     )
     print("[%s] %s" % (label, summary))
     print("=" * 60)

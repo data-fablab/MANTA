@@ -230,7 +230,9 @@ def compute_component_positions_3d(
         )
         from ..propulsion.edf_model import EDF_70MM
 
-        placement = compute_duct_placement(p, EDF_70MM)
+        from ..config import duct_from_config, load_config
+        _duct_cfg = duct_from_config(load_config())
+        placement = compute_duct_placement(p, EDF_70MM, config=_duct_cfg)
         centerline = compute_duct_centerline(placement, n_pts=60)
         x_start = centerline[0, 0]
         x_end = centerline[-1, 0]

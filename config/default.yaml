@@ -95,7 +95,7 @@ duct:
   intake_x_frac: 0.04            # intake at 4% body chord
   fan_x_frac: 0.40               # fan at 40% body chord
   exhaust_x_frac: 0.93           # exhaust at 93% body chord
-  intake_width_factor: 2.5       # × fan_diameter (sized for 25 m/s mass flow)
+  intake_width_factor: 1.2       # × fan_diameter (nEUROn-style flush scoop)
   intake_depth_factor: 0.7       # × fan_diameter
   intake_ramp_factor: 3.0        # × intake_depth
   nozzle_area_ratio: 0.80        # exhaust / fan area

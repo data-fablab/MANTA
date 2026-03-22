@@ -109,19 +109,18 @@ def compute_duct_placement(params: BWBParams, edf: EDFSpec,
     fan_x_frac = best_fan_x
     fan_x = fan_x_frac * body_chord
 
-    # Fan centerline at body midpoint (symmetric clearance top/bottom)
+    # Fan centerline: shifted toward intrados to keep intake flush with extrados.
+    # The offset is a fraction of body half-height: 0 = centered, -1 = at intrados.
     z_up_fan, _, z_lo_fan = _body_surface_z(fan_x_frac, body_tc, camber, reflex, le_droop)
-    fan_z = (z_up_fan + z_lo_fan) / 2 * body_chord
+    body_half_h = (z_up_fan - z_lo_fan) / 2 * body_chord
+    z_mid = (z_up_fan + z_lo_fan) / 2 * body_chord
+    duct_z_bias = -0.37  # shift 37% of half-height toward intrados
+    fan_z = z_mid + duct_z_bias * body_half_h
 
-    # ── Exhaust placement: as far aft as clearance allows ──
-    required_height = exhaust_height + 2 * duct_wall + 0.005  # 5mm margin
-    exhaust_x_frac = config.exhaust_x_frac  # start from config target
-    for x_frac in np.linspace(config.exhaust_x_frac, 0.75, 20):
-        z_up, _, z_lo = _body_surface_z(x_frac, body_tc, camber, reflex, le_droop)
-        available = (z_up - z_lo) * body_chord
-        if available >= required_height:
-            exhaust_x_frac = x_frac
-            break
+    # ── Exhaust placement: fixed at config target ──
+    # The exhaust is a slot that cuts through the TE — no height constraint.
+    # The nozzle converges from fan circle to flat exit over this full length.
+    exhaust_x_frac = config.exhaust_x_frac
     exhaust_x = exhaust_x_frac * body_chord
 
     # Exhaust centerline at body midpoint
@@ -389,20 +388,17 @@ def compute_duct_centerline(placement: DuctPlacement,
     """
     p = placement
 
-    # ── Segment 1: Intake throat → Fan (S-duct) ──
-    # P0: throat bottom (end of NACA ramp, submerged below OML)
-    # Per NACA submerged inlet design: the S-duct starts at the
-    # deepest point of the intake ramp, NOT at the upper surface.
-    p0 = np.array([p.intake_x + p.intake_length, 0.0,
-                   p.intake_z - p.intake_depth])
+    # ── Segment 1: Intake lip → Fan (S-duct) ──
+    p0 = np.array([p.intake_x, 0.0, p.intake_z])
     # P3: fan face center
     p3 = np.array([p.fan_x, 0.0, p.fan_z])
 
-    # Control points: tangent at throat is nearly horizontal (shallow
-    # ramp exit, ~5-7° per NACA guidelines), tangent at fan is horizontal.
+    # Control points: P1 dives steeply to stay inside the body
+    # as the cross-section grows from lip to full intake size.
     dx_13 = p3[0] - p0[0]
-    p1 = p0 + np.array([dx_13 * 0.4, 0.0, 0.0])     # horizontal departure
-    p2 = p3 + np.array([-dx_13 * 0.35, 0.0, 0.0])    # horizontal approach
+    dz_13 = p3[2] - p0[2]  # negative (diving down from OML to fan)
+    p1 = p0 + np.array([dx_13 * 0.1, 0.0, dz_13 * 0.9])  # dive very fast
+    p2 = p3 + np.array([-dx_13 * 0.3, 0.0, 0.0])           # horizontal approach to fan
 
     n1 = n_pts // 2
     seg1 = _cubic_bezier(p0, p1, p2, p3, n1)
@@ -461,40 +457,44 @@ def duct_cross_section(t: float, placement: DuctPlacement,
     """
     p = placement
 
-    # Three anchor stations defined by placement geometry
-    # (half_width, half_height, superellipse_exponent)
+    # Four anchor stations: lip → intake full → fan → exhaust
     r_fan = p.fan_diameter / 2
     intake_a = p.intake_width / 2
     intake_b = p.intake_depth / 2
     exhaust_a = p.exhaust_width / 2
     exhaust_b = p.exhaust_height / 2
 
-    # Anchor areas (exact, from placement)
-    area_intake = intake_a * intake_b * np.pi  # ~ellipse
-    area_fan = np.pi * r_fan ** 2              # circle
-    area_exhaust = exhaust_a * exhaust_b * np.pi  # ellipse
+    # t=0.00: lip (barely open — near-zero height, narrow)
+    # t=0.15: intake full size (ramp end, D-shape)
+    # t=0.50: fan face (circular)
+    # t=1.00: exhaust (flat ellipse)
+    t_lip = 0.0
+    t_intake = 0.15  # ~intake_length / total_duct_length
+    t_fan = 0.50
+    t_exhaust = 1.0
 
-    # Smooth area interpolation: intake → fan → exhaust
-    # Use cubic hermite to avoid abrupt contraction
-    if t <= 0.5:
-        # Intake → fan: smooth area transition
-        s = t / 0.5  # 0→1
-        s_smooth = 3 * s**2 - 2 * s**3  # smoothstep
-        area_target = area_intake * (1 - s_smooth) + area_fan * s_smooth
-        # Width: from intake_a to r_fan
-        a = intake_a * (1 - s_smooth) + r_fan * s_smooth
-    else:
-        # Fan → exhaust: smooth area transition
-        s = (t - 0.5) / 0.5  # 0→1
+    lip_a = intake_a * 0.15      # narrow at lip
+    lip_b = 0.002                # ~2mm — barely open
+
+    if t <= t_intake:
+        # Lip → intake full: cubic ramp (NACA profile)
+        s = t / t_intake  # 0→1
+        s_cubic = s ** 3   # NACA cubic depth profile
+        a = lip_a + (intake_a - lip_a) * s ** 0.5   # width opens fast
+        b = lip_b + (intake_b - lip_b) * s_cubic     # depth opens slow (cubic)
+    elif t <= t_fan:
+        # Intake full → fan: smooth transition
+        s = (t - t_intake) / (t_fan - t_intake)  # 0→1
         s_smooth = 3 * s**2 - 2 * s**3
-        area_target = area_fan * (1 - s_smooth) + area_exhaust * s_smooth
-        # Width: from r_fan to exhaust_a
+        a = intake_a * (1 - s_smooth) + r_fan * s_smooth
+        b = intake_b * (1 - s_smooth) + r_fan * s_smooth
+    else:
+        # Fan → exhaust: smooth transition
+        s = (t - t_fan) / (t_exhaust - t_fan)  # 0→1
+        s_smooth = 3 * s**2 - 2 * s**3
         a = r_fan * (1 - s_smooth) + exhaust_a * s_smooth
+        b = r_fan * (1 - s_smooth) + exhaust_b * s_smooth
 
-    # Height from area: b = area_target / (pi * a)
-    b = area_target / (np.pi * max(a, 0.001))
-
-    # Pure ellipse everywhere (n=2.0) — simple, no oscillations
     n_exp = 2.0
 
     # D-shape blend: for t < 0.25, flatten the top (flush with OML)
@@ -925,7 +925,9 @@ def build_propulsion_mesh(params: BWBParams, edf: EDFSpec,
     Returns list of [p0, p1, p2] triangle vertex arrays (same format
     as _loft_sections in export.py).
     """
-    placement = compute_duct_placement(params, edf)
+    from ..config import duct_from_config, load_config
+    _duct_cfg = duct_from_config(load_config())
+    placement = compute_duct_placement(params, edf, config=_duct_cfg)
     triangles = []
 
     # Build all component cross-sections

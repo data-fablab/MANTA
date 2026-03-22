@@ -227,7 +227,9 @@ class AeroEvaluator:
         # Duct fit constraint (adaptive placement + station-by-station clearance)
         body_chord = params.body_root_chord
         from ..propulsion.duct_geometry import compute_duct_placement, validate_duct_clearance
-        placement = compute_duct_placement(params, mission.edf)
+        from ..config import duct_from_config, load_config
+        _duct_cfg = duct_from_config(load_config())
+        placement = compute_duct_placement(params, mission.edf, config=_duct_cfg)
         _duct_ok, _clr = validate_duct_clearance(placement, params, min_clearance_mm=0.0)
         min_duct_clearance_mm = min(
             min(r.clearance_top_mm, r.clearance_bot_mm) for r in _clr

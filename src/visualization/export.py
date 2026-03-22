@@ -463,8 +463,10 @@ def export_cad_profiles(params: BWBParams, output_dir: str,
         )
         from ..propulsion.edf_model import EDF_70MM
 
+        from ..config import duct_from_config, load_config
+        _duct_cfg = duct_from_config(load_config())
         prop_edf = edf if edf is not None else EDF_70MM
-        placement = compute_duct_placement(p, prop_edf)
+        placement = compute_duct_placement(p, prop_edf, config=_duct_cfg)
         duct_profiles = get_duct_profiles(placement, n_profile=40)
 
         # Save duct cross-section profiles
@@ -1156,7 +1158,9 @@ def _export_with_propulsion(params: BWBParams, path: str,
     # Step 2: Duct placement
     # ==================================================================
     print("[prop] 2/6  Computing duct placement...")
-    placement = compute_duct_placement(p, prop_edf)
+    from ..config import duct_from_config, load_config
+    _duct_cfg = duct_from_config(load_config())
+    placement = compute_duct_placement(p, prop_edf, config=_duct_cfg)
 
     # ==================================================================
     # Step 3: Internal duct solid (at actual position, no extensions)
@@ -1190,20 +1194,19 @@ def _export_with_propulsion(params: BWBParams, path: str,
         main_duct = _loft_duct_solid(all_duct_secs)
 
         # 2. Extensions to pierce the OML for boolean Cut openings
-        # Length = body thickness at that station + margin, to fully traverse the body
+        # Intake: extrude upward (+Z) to cut through the upper OML surface
         body_thickness_mm = p.body_tc_root * p.body_root_chord * 1000
-        ext_len = body_thickness_mm + 50  # mm, generous margin to ensure clean cut
-
         first_wire = _make_closed_wire(all_duct_secs[0] * 1000.0)
         first_face = BRepBuilderAPI_MakeFace(first_wire, True).Face()
         intake_ext = BRepPrimAPI_MakePrism(
-            first_face, gp_Vec(-ext_len, 0.0, 0.0)
+            first_face, gp_Vec(0.0, 0.0, body_thickness_mm)  # up through OML
         ).Shape()
 
+        # Exhaust: extrude downstream (+X) to cut through the trailing edge
         last_wire = _make_closed_wire(all_duct_secs[-1] * 1000.0)
         last_face = BRepBuilderAPI_MakeFace(last_wire, True).Face()
         exhaust_ext = BRepPrimAPI_MakePrism(
-            last_face, gp_Vec(ext_len, 0.0, 0.0)
+            last_face, gp_Vec(body_thickness_mm, 0.0, 0.0)  # aft through TE
         ).Shape()
 
         # 3. Fuse main + extensions
@@ -1262,17 +1265,43 @@ def _export_with_propulsion(params: BWBParams, path: str,
             expanded = sec + unit_dirs * (skin_mm / 1000.0)  # mm → m
             shell_secs.append(expanded)
 
-        shell_outer = _loft_duct_solid(shell_secs)
-        # Hollow the shell: subtract inner duct volume
-        shell_inner = _loft_duct_solid(all_duct_secs)
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut as _BRepCut
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Common as _BRepCommon
+
+        # 1. Build full hollow shell (outer - inner)
+        shell_outer = _loft_duct_solid(shell_secs)
+        shell_inner = _loft_duct_solid(all_duct_secs)
         shell_cutter = _BRepCut(shell_outer, shell_inner)
         shell_cutter.Build()
         if shell_cutter.IsDone():
-            shell_solid = shell_cutter.Shape()
+            shell_hollow = shell_cutter.Shape()
         else:
             warnings.warn("Shell hollowing failed — using solid shell")
-            shell_solid = shell_outer
+            shell_hollow = shell_outer
+
+        # 2. Clip to OML: keeps only the part inside the body
+        #    (cuts intake protrusion + nozzle protrusion)
+        shell_clipped = _BRepCommon(shell_hollow, oml_solid)
+        shell_clipped.Build()
+
+        # 3. Get the nozzle protrusion: Cut(shell, OML) = part OUTSIDE body
+        nozzle_protrusion = _BRepCut(shell_hollow, oml_solid)
+        nozzle_protrusion.Build()
+
+        # 4. Combine: clipped shell + nozzle protrusion as compound
+        #    (compound avoids thin-wall Fuse issues)
+        if shell_clipped.IsDone() and nozzle_protrusion.IsDone():
+            compound_builder = BRep_Builder()
+            shell_compound = TopoDS_Compound()
+            compound_builder.MakeCompound(shell_compound)
+            compound_builder.Add(shell_compound, shell_clipped.Shape())
+            compound_builder.Add(shell_compound, nozzle_protrusion.Shape())
+            shell_solid = shell_compound
+        elif shell_clipped.IsDone():
+            shell_solid = shell_clipped.Shape()
+        else:
+            shell_solid = shell_hollow
+
         vol_s = GProp_GProps()
         BRepGProp.VolumeProperties_s(shell_solid, vol_s)
         shell_kb = 0
@@ -1282,7 +1311,7 @@ def _export_with_propulsion(params: BWBParams, path: str,
             shell_path, cq.exporters.ExportTypes.STEP,
         )
         shell_kb = os.path.getsize(shell_path) / 1024
-        print("[prop]      Shell OK — hollow (vol=%.1f cm3, %.0f KB)" % (
+        print("[prop]      Shell OK — hollow + clipped (vol=%.1f cm3, %.0f KB)" % (
             abs(vol_s.Mass()) / 1e6, shell_kb))
     except Exception as e:
         warnings.warn("Shell build failed: %s" % e)

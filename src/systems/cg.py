@@ -151,8 +151,10 @@ def compute_cg(
             compute_duct_placement, compute_duct_structure_mass,
         )
         from ..propulsion.edf_model import EDF_70MM
-        placement = compute_duct_placement(params, EDF_70MM)
-        duct_mass = compute_duct_structure_mass(placement)
+        from ..config import duct_from_config, load_config
+        _duct_cfg = duct_from_config(load_config())
+        placement = compute_duct_placement(params, EDF_70MM, config=_duct_cfg)
+        duct_mass = compute_duct_structure_mass(placement, config=_duct_cfg)
         components.append(ComponentPlacement(
             "duct_structure", duct_mass,
             x_cg=body_chord * placement.fan_x_frac,  # CG near fan face

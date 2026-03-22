@@ -30,6 +30,8 @@ PRIMITIVE_TARGETS = [
     "x_cg_frac", "Vs",
     # v5: duct clearance (adaptive placement)
     "min_duct_clearance_mm",
+    # v6: direct CD and L/D (eliminates quadratic error propagation via CDi)
+    "CD", "L_over_D",
 ]
 
 # Backward-compatible: the original 7 targets for loading legacy models
@@ -57,6 +59,9 @@ _TARGET_CLIP = {
     "x_cg_frac":                (0.2, 1.0),
     "Vs":                       (5.0, 25.0),
     "min_duct_clearance_mm":    (-20.0, 50.0),
+    # v6: direct aero outputs
+    "CD":                       (0.005, 0.200),
+    "L_over_D":                 (-30.0, 30.0),
 }
 
 
@@ -182,6 +187,12 @@ class SurrogateModel:
                 if clr_val is None:
                     continue
                 row.append(clr_val)
+            if self._n_targets >= 19:
+                cd_val = r.get("CD", None)
+                ld_val = r.get("L_over_D", None)
+                if cd_val is None or ld_val is None:
+                    continue
+                row.extend([cd_val, ld_val])
 
             Y_rows.append(row)
             valid_indices.append(i)

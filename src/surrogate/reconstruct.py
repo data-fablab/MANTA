@@ -357,9 +357,10 @@ def reconstruct_aero(
     cd_intake = 0.05 * s_intake / np.maximum(s_ref, 1e-6)
     cd0 = cd0_wing + cd0_body + cd_intake
 
+    # CD and L/D: use direct surrogate predictions if available,
+    # otherwise fall back to analytical reconstruction
     cdi = np.where(ar > 1.0, cl ** 2 / (np.pi * ar * e_oswald), 0.1)
 
-    # Trim drag
     cl_de_pred = np.atleast_1d(np.asarray(primitives.get("CL_de", 0.015), dtype=float))
     delta_cl_trim = cl_de_pred * np.radians(elevon_defl)
     cd_trim_induced = np.where(ar > 1.0, delta_cl_trim**2 / (np.pi * ar * e_oswald), 0.0)
@@ -368,8 +369,17 @@ def reconstruct_aero(
         cd_trim_induced + 0.0001 * np.abs(elevon_defl) / 10.0,
         0.0,
     )
-    cd = cd0 + cdi + cd_trim
-    ld = np.where(cd > 1e-4, cl / cd, 0.0)
+
+    if "CD" in primitives:
+        cd = np.atleast_1d(np.asarray(primitives["CD"], dtype=float))
+    else:
+        cd = cd0 + cdi + cd_trim
+
+    if "L_over_D" in primitives:
+        ld = np.atleast_1d(np.asarray(primitives["L_over_D"], dtype=float))
+    else:
+        ld = np.where(cd > 1e-4, cl / cd, 0.0)
+
     cd_effective = cd * feasibility.drag_margin
 
     # --- Propulsion reconstruction ---

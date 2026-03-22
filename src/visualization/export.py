@@ -1262,7 +1262,17 @@ def _export_with_propulsion(params: BWBParams, path: str,
             expanded = sec + unit_dirs * (skin_mm / 1000.0)  # mm → m
             shell_secs.append(expanded)
 
-        shell_solid = _loft_duct_solid(shell_secs)
+        shell_outer = _loft_duct_solid(shell_secs)
+        # Hollow the shell: subtract inner duct volume
+        shell_inner = _loft_duct_solid(all_duct_secs)
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut as _BRepCut
+        shell_cutter = _BRepCut(shell_outer, shell_inner)
+        shell_cutter.Build()
+        if shell_cutter.IsDone():
+            shell_solid = shell_cutter.Shape()
+        else:
+            warnings.warn("Shell hollowing failed — using solid shell")
+            shell_solid = shell_outer
         vol_s = GProp_GProps()
         BRepGProp.VolumeProperties_s(shell_solid, vol_s)
         shell_kb = 0
@@ -1272,7 +1282,7 @@ def _export_with_propulsion(params: BWBParams, path: str,
             shell_path, cq.exporters.ExportTypes.STEP,
         )
         shell_kb = os.path.getsize(shell_path) / 1024
-        print("[prop]      Shell OK (vol=%.1f cm3, %.0f KB)" % (
+        print("[prop]      Shell OK — hollow (vol=%.1f cm3, %.0f KB)" % (
             abs(vol_s.Mass()) / 1e6, shell_kb))
     except Exception as e:
         warnings.warn("Shell build failed: %s" % e)

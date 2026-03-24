@@ -48,30 +48,52 @@ class AeroModelConfig:
     k_3d_tc_threshold: float = 0.12
     alpha_trim_clip_min: float = -2.0
     alpha_trim_clip_max: float = 12.0
+    cd_gear: float = 0.0015
+
+
+@dataclass
+class ServoConfig:
+    """Servo hinge moment parameters."""
+    torque_max_kgcm: float = 1.3
+    ch_delta: float = -0.60
+    n_servos_elevon: int = 2
 
 
 @dataclass
 class DuctGeometryConfig:
-    """Duct geometry placement and sizing."""
-    intake_x_frac: float = 0.04
-    fan_x_frac: float = 0.40
+    """Duct geometry sizing — physics-based parameters.
+
+    Ref: NACA RM-A7I30 (intake), Seddon & Goldsmith (S-duct).
+    """
+    # Intake
+    intake_capture_ratio: float = 1.25
+    intake_ramp_angle_deg: float = 6.0
+    intake_width_depth_ratio: float = 4.0
+    intake_min_body_margin_mm: float = 10.0
+    # S-duct
+    max_offset_length_ratio: float = 0.25
+    sduct_area_ratio: float = 1.1
+    # Fan
+    fan_clearance_min_mm: float = 5.0
+    # Nozzle
+    nozzle_area_ratio: float = 0.90
     exhaust_x_frac: float = 0.93
-    intake_width_factor: float = 1.8
-    intake_depth_factor: float = 0.5
-    intake_ramp_factor: float = 3.0
-    nozzle_area_ratio: float = 0.80
-    duct_wall_mm: float = 1.0
+    # Structure
+    duct_wall_mm: float = 1.2
     housing_length_factor: float = 1.5
     material_density: float = 1500.0
-    structural_adder: float = 1.30
+    structural_adder: float = 1.25
 
 
 @dataclass
 class DuctAeroConfig:
-    """Duct aerodynamic performance parameters."""
-    pr_intake: float = 0.95
-    k_sduct: float = 0.15
-    pr_nozzle: float = 0.98
+    """Duct aero — sourced correlations.
+
+    Ref: Seddon & Goldsmith (S-duct), NASA TN-D-4014 (ducted fan).
+    """
+    pr_intake: float = 0.93
+    k_sduct: float = 0.12
+    pr_nozzle: float = 0.96
     cd_intake_base: float = 0.05
     static_capture_factor: float = 1.2
 
@@ -148,6 +170,7 @@ def feasibility_from_config(cfg: dict) -> FeasibilityConfig:
                 "volume_min", "cn_beta_min", "td_min", "endurance_min",
                 "drag_margin", "vs_max", "cl_max_clean", "alpha_trim_max",
                 "elevon_deflection_max", "cl_beta_cn_beta_max",
+                "servo_torque_max_kgcm",
                 "manufacturability_min"]:
         if key in f:
             kwargs[key] = f[key]
@@ -166,6 +189,8 @@ def cg_from_config(cfg: dict) -> CGConfig:
         avionics_xc=c.get("avionics_xc", 0.28),
         servo_mass=c.get("servo_mass_kg", 0.040),
         servo_xc=c.get("servo_xc", 0.70),
+        gear_mass=c.get("gear_mass_kg", 0.050),
+        gear_xc=c.get("gear_xc", 0.55),
     )
 
 
@@ -202,7 +227,7 @@ def aero_model_from_config(cfg: dict) -> AeroModelConfig:
     kwargs["alpha_trim_clip_min"] = trim_clip[0]
     kwargs["alpha_trim_clip_max"] = trim_clip[1]
     for key in ["interference_wing", "interference_body", "wetted_area_ratio",
-                "k_3d", "k_3d_tc_threshold"]:
+                "k_3d", "k_3d_tc_threshold", "cd_gear"]:
         if key in a:
             kwargs[key] = a[key]
     return AeroModelConfig(**kwargs)
@@ -238,6 +263,16 @@ def structure_from_config(cfg: dict) -> StructureConfig:
     return StructureConfig(**kwargs)
 
 
+def servo_from_config(cfg: dict) -> ServoConfig:
+    """Build ServoConfig from config dict."""
+    s = cfg.get("servo", {})
+    kwargs = {}
+    for key in ServoConfig.__dataclass_fields__:
+        if key in s:
+            kwargs[key] = s[key]
+    return ServoConfig(**kwargs)
+
+
 def manuf_from_config(cfg: dict) -> ManufConfig:
     """Build ManufConfig from config dict."""
     m = cfg.get("manufacturability", {})
@@ -268,5 +303,6 @@ def load_all(path: str | Path | None = None) -> dict[str, Any]:
         "duct_aero": duct_aero_from_config(cfg),
         "structure": structure_from_config(cfg),
         "manufacturability": manuf_from_config(cfg),
+        "servo": servo_from_config(cfg),
         "avl_command": cfg.get("avl", {}).get("command", "avl"),
     }

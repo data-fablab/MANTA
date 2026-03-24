@@ -2,9 +2,15 @@
 from .features import augment_features
 
 PRIMITIVE_TARGETS = [
-    "CL_0", "CL_alpha", "CM_0", "CM_alpha", "CD0_wing", "CD0_body", "Cn_beta",
+    "CL_0", "CL_alpha", "CM_0", "CM_alpha",
+    "CD0_wing", "CD0_body", "Cn_beta",
     "Cl_beta", "CL_de", "Cm_de",
     "CL",
+    "struct_mass", "internal_volume", "manufacturability_score",
+    "x_cg_frac", "Vs",
+    "CD", "L_over_D",
+    "elevon_deflection",
+    "static_margin",
 ]
 
 

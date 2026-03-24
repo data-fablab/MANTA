@@ -35,9 +35,9 @@ def train_surrogate():
     n_ctrl = sum(1 for r in results if "Cmd01" in r and "c_ref" in r)
     print(f"  {len(results)} samples, {n_ctrl} with new c_ref primitives")
 
-    print("\nTraining 10-target surrogate (5 ensemble)...")
+    print("\nTraining surrogate (5 ensemble)...")
     t0 = time.time()
-    surr = SurrogateModel(n_ensemble=5, _n_targets=10)
+    surr = SurrogateModel(n_ensemble=5)
     ok = surr.fit(X, results, min_samples=30)
     elapsed = time.time() - t0
     print(f"  Success: {ok}, time: {elapsed:.0f}s, arch: {surr.architecture_str}")

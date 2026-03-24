@@ -16,7 +16,7 @@ from .style import COLORS, FONT_SIZES, clean_spines, save_fig
 from ..parameterization.design_variables import BWBParams
 from ..parameterization.bwb_aircraft import (
     build_kulfan_airfoil_at_station,
-    build_body_airfoil,
+    build_body_kulfan_at_station,
     OUTER_WING_STATIONS,
     N_OUTER_SEGMENTS,
     BODY_STATIONS,
@@ -189,12 +189,9 @@ def plot_airfoils(params: BWBParams, save_path: str | None = None):
     p = params
     fig, axes = plt.subplots(2, 2, figsize=(12, 6))
 
-    # 1. Body center airfoil
-    af_center = build_body_airfoil(
-        tc=p.body_tc_root, camber=p.body_camber,
-        reflex=p.body_reflex, le_droop=p.body_le_droop,
-        name="body_center",
-    )
+    # 1. Body center airfoil (Kulfan CST)
+    kaf_center = build_body_kulfan_at_station(p, 0.0, name="body_center")
+    af_center = kaf_center.to_airfoil()
     coords = af_center.coordinates
     ax = axes[0, 0]
     ax.plot(coords[:, 0], coords[:, 1], "b-", linewidth=1.5)

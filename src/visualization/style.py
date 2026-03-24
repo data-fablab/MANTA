@@ -1,4 +1,4 @@
-"""Unified matplotlib styling for nEUROn v2 visualizations.
+"""Unified matplotlib styling for MANTA visualizations.
 
 Provides a consistent, professional look across all notebooks and
 plotting functions: color palette, font sizes, spine management,
@@ -89,7 +89,7 @@ DPI_SAVE = 150
 # ═══════════════════════════════════════════════════════════════════════════
 
 def apply_style():
-    """Apply nEUROn unified style to all matplotlib figures.
+    """Apply MANTA unified style to all matplotlib figures.
 
     Call once at the top of each notebook or script.
     """

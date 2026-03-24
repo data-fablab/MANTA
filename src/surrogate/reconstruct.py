@@ -381,19 +381,20 @@ def reconstruct_aero(
     cd_intake = 0.05 * s_intake / np.maximum(s_ref, 1e-6)
     cd_gear = _ac.cd_gear
 
-    # Bump fairing drag: where duct protrudes above body OML
-    # bump_height ≈ max(0, duct_od - body_height_at_fan)
-    from ..parameterization.bwb_aircraft import vectorized_body_tc_at_xc
-    btc_fan = vectorized_body_tc_at_xc(
-        x[:, _IDX_BODY_KU_U2], x[:, _IDX_BODY_KU_U6], x[:, _IDX_BODY_KU_U7],
-        x[:, _IDX_BODY_KU_L2], x[:, _IDX_BODY_KU_L6], x[:, _IDX_BODY_KU_L7],
-        x_frac=0.40,
-    )
-    body_h_fan = btc_fan * body_root_chord
+    # Bump fairing drag: duct protrusion above body OML at 3 stations
     duct_od = mission.edf.duct_outer_diameter
-    bump_h = np.maximum(0.0, duct_od - body_h_fan)  # [m]
-    # Bump geometry: length ≈ 40% of body chord, width ≈ duct_od
-    bump_l = 0.40 * body_root_chord  # chordwise extent
+    bump_h = np.zeros(n)
+    bump_start_xf = np.full(n, 0.80)
+    bump_end_xf = np.full(n, 0.15)
+    for xf in (0.15, 0.40, 0.80):
+        body_h = _body_tc_from_x(x, xf) * body_root_chord
+        protrusion = np.maximum(0.0, duct_od - body_h)
+        has_bump = protrusion > 0
+        bump_h = np.maximum(bump_h, protrusion)
+        bump_start_xf = np.where(has_bump, np.minimum(bump_start_xf, xf), bump_start_xf)
+        bump_end_xf = np.where(has_bump, np.maximum(bump_end_xf, xf), bump_end_xf)
+    bump_l = np.maximum((bump_end_xf - bump_start_xf) * body_root_chord,
+                        0.05 * body_root_chord)
     bump_w = np.full_like(bump_h, duct_od)
     # Hoerner form factor for streamlined protuberance
     hl = bump_h / np.maximum(bump_l, 1e-6)
@@ -406,7 +407,15 @@ def reconstruct_aero(
     cd0_bump = cf_bump * ff_bump * s_wet_bump / np.maximum(s_ref, 1e-6)
     cd0_bump = np.where(bump_h > 0, cd0_bump, 0.0)
 
-    cd0 = cd0_wing + cd0_body + cd_intake + cd_gear + cd0_bump
+    # Nozzle base drag (reduced by jet wake filling)
+    from ..config import DuctAeroConfig, DuctGeometryConfig
+    _dac = DuctAeroConfig()
+    _dgc = DuctGeometryConfig()
+    _fan_d = mission.edf.fan_diameter
+    _a_exit = np.pi / 4 * _fan_d ** 2 * _dgc.nozzle_area_ratio
+    cd_nozzle = _dac.k_base_te * _a_exit / np.maximum(s_ref, 1e-6) * (1 - _dac.f_jet_recovery)
+
+    cd0 = cd0_wing + cd0_body + cd_intake + cd_gear + cd0_bump + cd_nozzle
 
     # CD and L/D: use direct surrogate predictions if available,
     # otherwise fall back to analytical reconstruction
@@ -434,10 +443,15 @@ def reconstruct_aero(
     cd_effective = cd * feasibility.drag_margin
 
     # --- Propulsion reconstruction (delegated to balance.py) ---
+    # Approximate duct pressure recovery (no DuctPlacement in surrogate)
+    _pr_sduct = 1.0 - _dac.k_sduct * 0.32 ** 2  # avg offset_ratio ~0.32
+    _pr_total = _dac.pr_intake * _pr_sduct * _dac.pr_nozzle
+
     drag_force = cd_effective * q * s_ref
     from ..propulsion.balance import compute_propulsion_balance
     _prop = compute_propulsion_balance(drag_force, mission.velocity,
-                                        mission.edf, mission.battery)
+                                        mission.edf, mission.battery,
+                                        pr_total=_pr_total)
     t_available = _prop["T_available"]
     t_over_d = _prop["T_over_D"]
     p_elec = _prop["P_elec"]
@@ -467,6 +481,7 @@ def reconstruct_aero(
             cl_beta=float(cl_beta_pred[i]) if len(cl_beta_pred) > 1 else float(cl_beta_pred[0]),
             manufacturability_score=float(manuf_score[i]),
             servo_torque_kgcm=float(servo_torque[i]),
+            bump_height_mm=float(bump_h[i]) * 1000,
         )
         penalty[i] = p_val
         is_feasible[i] = feasibility.is_feasible(
@@ -486,13 +501,14 @@ def reconstruct_aero(
             cl_beta=float(cl_beta_pred[i]) if len(cl_beta_pred) > 1 else float(cl_beta_pred[0]),
             manufacturability_score=float(manuf_score[i]),
             servo_torque_kgcm=float(servo_torque[i]),
+            bump_height_mm=float(bump_h[i]) * 1000,
         )
 
     result = {
         "L_over_D": ld, "CL": cl, "CM": cm, "static_margin": sm,
         "alpha_eq": alpha_eq, "CDi": cdi, "CD": cd, "CD0": cd0,
         "CD0_wing": cd0_wing, "CD0_body": cd0_body, "CD_intake": cd_intake,
-        "CD_gear": cd_gear, "CD0_bump": cd0_bump,
+        "CD_gear": cd_gear, "CD0_bump": cd0_bump, "CD_nozzle": cd_nozzle,
         "CD_trim": cd_trim, "CD_effective": cd_effective, "Cn_beta": cn_beta,
         "oswald_e": e_oswald, "AR": ar, "S_ref": s_ref, "MAC": mac,
         "struct_mass": struct_mass, "internal_volume": internal_volume,

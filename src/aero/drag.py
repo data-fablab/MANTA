@@ -175,6 +175,29 @@ def compute_bump_cd0(
     return float(cf * ff * s_wet / max(s_ref, 1e-6))
 
 
+def compute_nozzle_exit_drag(
+    exhaust_width: float,
+    exhaust_height: float,
+    s_ref: float,
+    k_base: float = 0.12,
+    f_jet: float = 0.50,
+) -> float:
+    """Residual base drag from nozzle TE slot, reduced by jet wake filling.
+
+    CD_nozzle = k_base × (A_base / S_ref) × (1 - f_jet)
+
+    The jet thrust is NOT credited here (already in T/D balance via pr_total).
+    Only the wake-filling effect that reduces base pressure deficit.
+
+    References:
+    - Hoerner, Fluid-Dynamic Drag, Ch. 3 (blunt TE)
+    - ESDU 75028: base pressure on blunt trailing edges
+    """
+    a_base = exhaust_width * exhaust_height
+    cd_base = k_base * a_base / max(s_ref, 1e-6)
+    return cd_base * (1.0 - f_jet)
+
+
 def estimate_parasite_drag(params: BWBParams, velocity: float,
                            kinematic_viscosity: float) -> float:
     """Quick analytical CD0 estimate (fallback). Full aircraft."""

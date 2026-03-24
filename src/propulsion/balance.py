@@ -13,15 +13,27 @@ from .edf_model import (
 
 
 def compute_propulsion_balance(drag_force, velocity: float,
-                               edf: EDFSpec, battery: BatterySpec) -> dict:
+                               edf: EDFSpec, battery: BatterySpec,
+                               pr_total: float = 1.0,
+                               velocity_ratio: float = 1.5) -> dict:
     """Full propulsion balance from drag force.
 
     Works with scalar or numpy array `drag_force`.
 
+    Parameters
+    ----------
+    pr_total : float
+        Duct total pressure recovery (0-1). Default 1.0 = no installation loss.
+    velocity_ratio : float
+        V_exit / V_freestream (~1.5 for EDF 70mm at 25 m/s).
+        Amplifies PR loss: ΔT/T = (1 - PR) × velocity_ratio (Mattingly).
+
     Returns dict with: T_available, T_over_D, P_elec, endurance_s,
     endurance_min, range_km.
     """
-    t_avail = thrust_at_speed(edf, velocity)
+    t_uninstalled = thrust_at_speed(edf, velocity)
+    installation_loss = (1.0 - pr_total) * velocity_ratio
+    t_avail = t_uninstalled * max(1.0 - installation_loss, 0.0)
 
     # Vectorized path
     if isinstance(drag_force, np.ndarray):

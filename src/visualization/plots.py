@@ -250,6 +250,267 @@ def plot_airfoils(params: BWBParams, save_path: str | None = None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# CAD-style multi-view drawing
+# ═══════════════════════════════════════════════════════════════════════════
+
+def plot_cad_multiview(params: BWBParams, placement=None,
+                       controls=None, cg_data=None,
+                       save_path: str | None = None) -> plt.Figure:
+    """CAD-style 3-view drawing with duct integration.
+
+    Layout (third-angle projection):
+      Top-left:  Top view (XY) — planform + control surfaces
+      Top-right: Side view (XZ) — body profile + duct + bump
+      Bot-left:  Front view (YZ) — gull wing dihedral
+      Bot-right: Airfoil sections overlay
+
+    Parameters
+    ----------
+    params : BWBParams
+    placement : DuctPlacement, optional
+    controls : list of control surface geometries, optional
+    cg_data : dict with 'x_cg', 'x_cg_frac', optional
+    save_path : str, optional
+    """
+    from matplotlib.patches import Circle
+    from matplotlib.gridspec import GridSpec
+    from ..parameterization.bwb_aircraft import (
+        compute_wing_area, compute_aspect_ratio, compute_mac,
+        build_body_kulfan_at_station, build_kulfan_airfoil_at_station,
+        apply_duct_bump, outer_wing_twists, outer_wing_dihedrals,
+    )
+    from ..propulsion.duct_geometry import (
+        compute_duct_centerline, validate_duct_clearance,
+    )
+
+    p = params
+    bc = p.body_root_chord
+    bw = p.body_halfwidth
+    s_ref = compute_wing_area(p)
+    ar = compute_aspect_ratio(p)
+
+    fig = plt.figure(figsize=(20, 14))
+    fig.patch.set_facecolor('white')
+    gs = GridSpec(2, 2, figure=fig, hspace=0.18, wspace=0.15,
+                  height_ratios=[1.2, 1], width_ratios=[1, 1.3])
+    ax_top = fig.add_subplot(gs[0, 0])
+    ax_side = fig.add_subplot(gs[0, 1])
+    ax_front = fig.add_subplot(gs[1, 0])
+    ax_af = fig.add_subplot(gs[1, 1])
+
+    body_color = COLORS["body"]
+    wing_color = COLORS["wing"]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TOP-LEFT: Top View (XY) — planform + control surfaces
+    # ═══════════════════════════════════════════════════════════════════
+    body_sweep_rad = np.radians(p.body_sweep_deg)
+    wing_sweep_rad = np.radians(p.le_sweep_deg)
+    outer_span = p.outer_half_span
+
+    body_y = [frac * bw for frac in BODY_STATIONS]
+    body_le_x = [y * np.tan(body_sweep_rad) for y in body_y]
+    body_chords = [bc + frac * (p.wing_root_chord - bc) for frac in BODY_STATIONS]
+
+    x_blend = bw * np.tan(body_sweep_rad)
+    wing_dihedrals_deg = outer_wing_dihedrals(p)
+    wing_chords = [p.wing_root_chord + frac * (p.tip_chord - p.wing_root_chord)
+                   for frac in OUTER_WING_STATIONS]
+    wing_pos = [[x_blend, bw, 0.0]]
+    for i in range(N_OUTER_SEGMENTS):
+        prev = wing_pos[-1]
+        dy_seg = outer_span * (OUTER_WING_STATIONS[i+1] - OUTER_WING_STATIONS[i])
+        dih_rad = np.radians(wing_dihedrals_deg[i])
+        wing_pos.append([
+            prev[0] + dy_seg * np.tan(wing_sweep_rad),
+            prev[1] + dy_seg * np.cos(dih_rad),
+            prev[2] + dy_seg * np.sin(dih_rad),
+        ])
+
+    for sign in [1, -1]:
+        # Body
+        by = [y * sign * 1000 for y in body_y]
+        bx_le = [x * 1000 for x in body_le_x]
+        bx_te = [(lx + c) * 1000 for lx, c in zip(body_le_x, body_chords)]
+        ax_top.fill_betweenx(by, bx_le, bx_te, alpha=0.12, color=body_color,
+                             label="Body" if sign == 1 else None)
+        ax_top.plot(bx_le, by, color=body_color, lw=1.5)
+        ax_top.plot(bx_te, by, color=body_color, lw=1.5)
+
+        # Outer wing
+        wy = [pos[1] * sign * 1000 for pos in wing_pos]
+        wx_le = [pos[0] * 1000 for pos in wing_pos]
+        wx_te = [(pos[0] + c) * 1000 for pos, c in zip(wing_pos, wing_chords)]
+        ax_top.fill_betweenx(wy, wx_le, wx_te, alpha=0.10, color=wing_color,
+                             label="Wing" if sign == 1 else None)
+        ax_top.plot(wx_le, wy, color=wing_color, lw=1.5)
+        ax_top.plot(wx_te, wy, color=wing_color, lw=1.5)
+        ax_top.plot([wx_le[-1], wx_te[-1]], [wy[-1], wy[-1]], color=wing_color, lw=1.5)
+
+    ax_top.plot([0, bc * 1000], [0, 0], color=body_color, lw=1.5)
+
+    # Control surfaces
+    if controls is not None:
+        cs_colors = {'elevon': COLORS['elevon'], 'aileron': COLORS['aileron']}
+        for g in controls:
+            color = cs_colors.get(g.name, 'gray')
+            for sign in [1, -1]:
+                fill_x = np.concatenate([g.hinge_line_upper[:, 0], g.te_line_upper[::-1, 0]]) * 1000
+                fill_y = np.concatenate([g.hinge_line_upper[:, 1], g.te_line_upper[::-1, 1]]) * sign * 1000
+                ax_top.fill(fill_x, fill_y, alpha=0.30, color=color,
+                            label=g.name if sign == 1 else None)
+                ax_top.plot(g.hinge_line_upper[:, 0] * 1000,
+                            g.hinge_line_upper[:, 1] * sign * 1000,
+                            '--', color=color, lw=1.5)
+
+    # CG marker
+    if cg_data is not None:
+        ax_top.plot(cg_data['x_cg'] * 1000, 0, 'go', ms=8, zorder=10,
+                    label=f"CG x/c={cg_data['x_cg_frac']:.2f}")
+
+    ax_top.set_xlabel('X [mm]')
+    ax_top.set_ylabel('Y [mm]')
+    ax_top.set_title(f'Top View  |  span={2*p.half_span*1000:.0f}mm  AR={ar:.1f}  S={s_ref*1e4:.0f}cm²',
+                     fontsize=FONT_SIZES['subtitle'], fontweight='bold')
+    ax_top.set_aspect('equal')
+    ax_top.legend(fontsize=8, loc='upper right')
+    ax_top.grid(True, alpha=0.15)
+    ax_top.invert_yaxis()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TOP-RIGHT: Side View (XZ, y=0) — body + duct
+    # ═══════════════════════════════════════════════════════════════════
+    af_orig = build_body_kulfan_at_station(p, 0.0).to_airfoil()
+    af_orig_x = af_orig.coordinates[:, 0] * bc * 1000
+    af_orig_z = af_orig.coordinates[:, 1] * bc * 1000
+
+    if placement is not None:
+        coords_bumped = apply_duct_bump(af_orig.coordinates, placement, bc, bw, 0.0)
+        af_bump_x = coords_bumped[:, 0] * bc * 1000
+        af_bump_z = coords_bumped[:, 1] * bc * 1000
+
+        ax_side.fill_between(af_bump_x, af_bump_z, alpha=0.08, color='#2c3e50')
+        ax_side.plot(af_orig_x, af_orig_z, color='gray', lw=0.8, ls='--', alpha=0.4,
+                     label='Original Kulfan')
+        ax_side.plot(af_bump_x, af_bump_z, 'k-', lw=1.8, label='With duct bump')
+
+        # Duct envelope
+        _, clr = validate_duct_clearance(placement, p, min_clearance_mm=0.0)
+        intake_end_x = (placement.intake_x + placement.intake_length) * 1000
+        fan_x_mm = placement.fan_x * 1000
+        blend_zone = fan_x_mm - intake_end_x
+        dx_list, du_list, dl_list = [], [], []
+        for r in clr:
+            lo = r.centerline_z_mm - r.duct_half_h_mm
+            tube_up = r.centerline_z_mm + r.duct_half_h_mm
+            oml_up = r.body_z_upper_mm
+            if r.x_mm <= intake_end_x:
+                up = oml_up
+            elif r.x_mm >= fan_x_mm or blend_zone < 1:
+                up = tube_up
+            else:
+                t = (r.x_mm - intake_end_x) / blend_zone
+                blend = 0.5 * (1 - np.cos(np.pi * t))
+                up = oml_up * (1 - blend) + tube_up * blend
+            dx_list.append(r.x_mm)
+            du_list.append(up)
+            dl_list.append(lo)
+
+        ax_side.fill_between(dx_list, dl_list, du_list, alpha=0.18, color='#e74c3c',
+                             label='Duct envelope')
+        ax_side.plot(dx_list, du_list, color='#e74c3c', lw=1.2, ls='--')
+        ax_side.plot(dx_list, dl_list, color='#e74c3c', lw=1.2, ls='--')
+
+        # Centerline + markers
+        cl = compute_duct_centerline(placement, n_pts=80)
+        ax_side.plot(cl[:, 0]*1000, cl[:, 2]*1000, 'r-', lw=2, label='Centerline')
+        ax_side.plot(placement.intake_x*1000, placement.intake_z*1000, 'go', ms=8)
+        ax_side.plot(placement.fan_x*1000, placement.fan_z*1000, 'bs', ms=8)
+        ax_side.plot(placement.exhaust_x*1000, placement.exhaust_z*1000, 'r^', ms=8)
+
+        # EDF outline
+        fan_r = placement.duct_od / 2 * 1000
+        ax_side.add_patch(Circle((placement.fan_x*1000, placement.fan_z*1000),
+                                  fan_r, fill=False, color='#3498db', lw=1.5))
+
+        # Nozzle slot
+        ex = placement.exhaust_x * 1000
+        eh = placement.exhaust_height * 1000 / 2
+        ez = placement.exhaust_z * 1000
+        ax_side.plot([ex, ex], [ez - eh, ez + eh], color='orange', lw=3,
+                     solid_capstyle='round', zorder=5, label='Nozzle slot')
+    else:
+        ax_side.fill_between(af_orig_x, af_orig_z, alpha=0.08, color='#2c3e50')
+        ax_side.plot(af_orig_x, af_orig_z, 'k-', lw=1.8)
+
+    ax_side.set_xlabel('X [mm]')
+    ax_side.set_ylabel('Z [mm]')
+    duct_label = f'  duct OD={placement.duct_od*1000:.0f}mm' if placement else ''
+    ax_side.set_title(f'Side View (y=0)  |  chord={bc*1000:.0f}mm{duct_label}',
+                      fontsize=FONT_SIZES['subtitle'], fontweight='bold')
+    ax_side.set_aspect('equal')
+    ax_side.legend(fontsize=7, loc='upper right', ncol=2)
+    ax_side.grid(True, alpha=0.15)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # BOTTOM-LEFT: Front View (YZ) — gull wing dihedral
+    # ═══════════════════════════════════════════════════════════════════
+    for sign in [1, -1]:
+        by_f = [y * sign * 1000 for y in body_y]
+        ax_front.plot(by_f, [0.0] * len(body_y), color=body_color, lw=2.5,
+                      label="Body" if sign == 1 else None)
+
+        wy_f = [pos[1] * sign * 1000 for pos in wing_pos]
+        wz_f = [pos[2] * 1000 for pos in wing_pos]
+        ax_front.plot(wy_f, wz_f, color=wing_color, lw=2.5,
+                      label="Wing" if sign == 1 else None)
+
+    ax_front.plot(0, 0, 'go', ms=6)
+    dih_str = ', '.join(f'{d:.0f}°' for d in wing_dihedrals_deg)
+    ax_front.set_xlabel('Y [mm]')
+    ax_front.set_ylabel('Z [mm]')
+    ax_front.set_title(f'Front View  |  dihedral [{dih_str}]',
+                       fontsize=FONT_SIZES['subtitle'], fontweight='bold')
+    ax_front.set_aspect('equal')
+    ax_front.legend(fontsize=8)
+    ax_front.grid(True, alpha=0.15)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # BOTTOM-RIGHT: Airfoil sections (superposed)
+    # ═══════════════════════════════════════════════════════════════════
+    sections = [
+        ("Body center", build_body_kulfan_at_station(p, 0.0, "center"), '#E74C3C', 2.0),
+        ("Body blend", build_kulfan_airfoil_at_station(p, 0.0, "blend"), '#F39C12', 1.5),
+        ("Wing 50%", build_kulfan_airfoil_at_station(p, 0.5, "mid"), '#2E86DE', 1.5),
+        ("Wing tip", build_kulfan_airfoil_at_station(p, 1.0, "tip"), '#85C1E9', 1.0),
+    ]
+    for label, kaf, color, lw in sections:
+        af = kaf.to_airfoil()
+        tc = kaf.max_thickness()
+        c = af.coordinates
+        ax_af.plot(c[:, 0], c[:, 1], color=color, lw=lw,
+                   label=f'{label} (t/c={tc:.1%})')
+        ax_af.fill(c[:, 0], c[:, 1], alpha=0.06, color=color)
+
+    ax_af.set_xlabel('x/c')
+    ax_af.set_ylabel('z/c')
+    ax_af.set_title('Airfoil Sections', fontsize=FONT_SIZES['subtitle'], fontweight='bold')
+    ax_af.set_aspect('equal')
+    ax_af.legend(fontsize=8, loc='upper right')
+    ax_af.grid(True, alpha=0.15)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Title bar
+    # ═══════════════════════════════════════════════════════════════════
+    fig.suptitle('MANTA BWB — 32-variable parametric model',
+                 fontsize=16, fontweight='bold', y=0.98)
+
+    if save_path:
+        save_fig(fig, save_path)
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Optimization convergence
 # ═══════════════════════════════════════════════════════════════════════════
 

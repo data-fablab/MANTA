@@ -66,6 +66,7 @@ class DuctPlacement:
     duct_wall_thickness: float    # [m]
     housing_length: float         # [m] EDF cylindrical section
     body_chord: float             # [m] reference
+    intake_fallback: bool = False # True if no suitable intake location found
 
 
 @dataclass
@@ -168,11 +169,13 @@ def size_and_place_duct(params: BWBParams, edf: EDFSpec,
     required_height = intake_depth + min_body_margin
     # Scan from 5% to 25% chord
     intake_x_frac = 0.10  # default
+    intake_fallback = True
     for xf in np.linspace(0.05, 0.25, 40):
         z_up, _, z_lo = _body_surface_z(xf, params, _cache)
         body_h = (z_up - z_lo) * body_chord
         if body_h >= required_height:
             intake_x_frac = xf
+            intake_fallback = False
             break
     intake_x = intake_x_frac * body_chord
     z_up_intake, _, _ = _body_surface_z(intake_x_frac, params, _cache)
@@ -200,7 +203,8 @@ def size_and_place_duct(params: BWBParams, edf: EDFSpec,
         clr_top = z_up * body_chord - (fan_z_candidate + duct_radius)
         # Optimize: maximize bottom clearance (stay away from intrados)
         # while minimizing bump (top protrusion)
-        score = clr_bot - max(0, -clr_top) * 0.5  # penalize bump lightly
+        bump = max(0, -clr_top)
+        score = clr_bot - bump * 0.5 - bump ** 2 * 2.0
         if score > best_clearance:
             best_clearance = score
             best_fan_x_frac = xf
@@ -223,7 +227,7 @@ def size_and_place_duct(params: BWBParams, edf: EDFSpec,
             fan_x_frac = fan_x / body_chord
             # Recompute fan z at new position
             z_up, _, z_lo = _body_surface_z(fan_x_frac, params, _cache)
-            best_fan_z = (z_up + z_lo) / 2 * body_chord
+            best_fan_z = z_lo * body_chord + duct_radius + min_clearance
 
     fan_z = best_fan_z
 
@@ -249,7 +253,7 @@ def size_and_place_duct(params: BWBParams, edf: EDFSpec,
         exhaust_z=exhaust_z,
         exhaust_width=exhaust_width, exhaust_height=exhaust_height,
         duct_wall_thickness=duct_wall, housing_length=housing_length,
-        body_chord=body_chord,
+        body_chord=body_chord, intake_fallback=intake_fallback,
     )
 
 
@@ -313,8 +317,9 @@ def validate_duct_clearance(placement: DuctPlacement, params: BWBParams,
         if t < 0.15:
             duct_hh = duct_r * (t / 0.15)  # intake opens up
         elif t > 0.85:
-            duct_hh = max(placement.exhaust_height / 2,
-                          duct_r * ((1 - t) / 0.15))
+            s = (t - 0.85) / 0.15
+            blend = 0.5 * (1 - np.cos(np.pi * s))
+            duct_hh = duct_r * (1 - blend) + (placement.exhaust_height / 2) * blend
         else:
             duct_hh = duct_r
 
@@ -359,29 +364,44 @@ def compute_duct_centerline(placement: DuctPlacement,
     """
     p = placement
 
-    # Segment 1: intake ramp end → fan face
-    p0 = np.array([p.intake_x + p.intake_length, 0.0, p.intake_z - p.intake_depth])
+    # Segment 0: intake ramp — quadratic descent (matches build_intake_geometry)
+    ramp_end_x = p.intake_x + p.intake_length
+    ramp_end_z = p.intake_z - p.intake_depth  # bottom of ramp at frac=1
+    n0 = max(n_pts // 6, 4)
+
+    # Segment 1: ramp bottom → fan face (S-duct Bezier)
+    p0 = np.array([ramp_end_x, 0.0, ramp_end_z])
     p3 = np.array([p.fan_x, 0.0, p.fan_z])
     dx = p3[0] - p0[0]
-    dz = p3[2] - p0[2]
-    # Smooth S-curve: tangent horizontal at both ends
-    p1 = p0 + np.array([dx * 0.4, 0.0, 0.0])
+    # Tangent at ramp end: dz/dx = -2*depth/length (quadratic derivative at frac=1)
+    ramp_slope = -2 * p.intake_depth / max(p.intake_length, 1e-6)
+    ramp_end_dir = np.array([1.0, 0.0, ramp_slope])
+    ramp_end_dir /= np.linalg.norm(ramp_end_dir)
+    p1 = p0 + ramp_end_dir * dx * 0.4
     p2 = p3 + np.array([-dx * 0.4, 0.0, 0.0])
 
-    n1 = n_pts * 2 // 3
+    n1 = (n_pts - n0) * 2 // 3
     seg1 = _cubic_bezier(p0, p1, p2, p3, n1)
 
-    # Segment 2: fan face → exhaust
+    # Segment 2: fan face → exhaust (nozzle Bezier)
     q0 = p3.copy()
     q3 = np.array([p.exhaust_x, 0.0, p.exhaust_z])
     dx2 = q3[0] - q0[0]
     q1 = q0 + np.array([dx2 * 0.3, 0.0, 0.0])
     q2 = q3 + np.array([-dx2 * 0.3, 0.0, 0.0])
 
-    n2 = n_pts - n1
-    seg2 = _cubic_bezier(q0, q1, q2, q3, n2)
+    n2 = n_pts - n0 - n1
+    seg2 = _cubic_bezier(q0, q1, q2, q3, max(n2, 4))
 
-    return np.vstack([seg1, seg2[1:]])
+    # Intake ramp: quadratic z = intake_z - depth * frac² (NACA scoop profile)
+    frac_arr = np.linspace(0, 1, n0)
+    seg0 = np.column_stack([
+        p.intake_x + frac_arr * p.intake_length,
+        np.zeros(n0),
+        p.intake_z - p.intake_depth * frac_arr ** 2,
+    ])
+
+    return np.vstack([seg0, seg1[1:], seg2[1:]])
 
 
 def _cubic_bezier(p0, p1, p2, p3, n: int) -> np.ndarray:

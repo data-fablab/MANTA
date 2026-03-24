@@ -328,11 +328,75 @@ def flatten_airfoil_aft(coords_2d: np.ndarray, x_hinge: float = 0.75) -> np.ndar
     return result
 
 
+def apply_duct_bump(coords_2d: np.ndarray, placement, body_chord: float,
+                    body_halfwidth: float, station_y: float) -> np.ndarray:
+    """Raise upper surface where the duct protrudes above body OML.
+
+    Applies a smooth cosine fairing on the upper surface between
+    intake_x_frac and exhaust_x_frac.  The bump height tapers to zero
+    at the body halfwidth (duct is centered at y=0).
+
+    Parameters
+    ----------
+    coords_2d : (N, 2) Selig-format airfoil coordinates (x/c, z/c).
+    placement : DuctPlacement with duct geometry.
+    body_chord : body root chord [m].
+    body_halfwidth : [m].
+    station_y : spanwise y-position of this station [m].
+
+    Returns
+    -------
+    (N, 2) array with upper surface raised where duct protrudes.
+    """
+    if placement is None or station_y >= body_halfwidth:
+        return coords_2d
+
+    result = coords_2d.copy()
+    mid = np.argmin(result[:, 0])  # LE index
+
+    duct_r = placement.duct_od / 2 + placement.duct_wall_thickness
+
+    # Spanwise taper: bump full at y=0, zero at body_halfwidth
+    y_taper = max(0.0, 1.0 - station_y / body_halfwidth)
+
+    # Upper surface: indices 0..mid in Selig (TE→LE), reverse for LE→TE
+    x_up = result[:mid + 1, 0][::-1]
+    z_up = result[:mid + 1, 1][::-1]
+
+    x_start = placement.intake_x_frac
+    x_end = placement.exhaust_x_frac
+
+    for j in range(len(x_up)):
+        xc = x_up[j]
+        if x_start <= xc <= x_end:
+            # Duct centerline z/c (linear interp intake→fan→exhaust)
+            if xc <= placement.fan_x_frac:
+                t = (xc - x_start) / max(placement.fan_x_frac - x_start, 1e-6)
+                duct_center_z = (placement.intake_z + t * (placement.fan_z - placement.intake_z)) / body_chord
+            else:
+                t = (xc - placement.fan_x_frac) / max(x_end - placement.fan_x_frac, 1e-6)
+                duct_center_z = (placement.fan_z + t * (placement.exhaust_z - placement.fan_z)) / body_chord
+
+            duct_top_zc = duct_center_z + duct_r / body_chord
+            protrusion = duct_top_zc - z_up[j]
+            if protrusion > 0:
+                frac = (xc - x_start) / max(x_end - x_start, 1e-6)
+                envelope = 0.5 * (1 - np.cos(2 * np.pi * frac))
+                z_up[j] += protrusion * envelope * y_taper
+
+    # Write back (reverse to Selig TE→LE)
+    result[:mid + 1, 0] = x_up[::-1]
+    result[:mid + 1, 1] = z_up[::-1]
+
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Aircraft assembly
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_airplane(params: BWBParams, x_cg: float | None = None) -> asb.Airplane:
+def build_airplane(params: BWBParams, x_cg: float | None = None,
+                   duct_placement=None) -> asb.Airplane:
     """Build AeroSandbox Airplane with center-body + outer wing.
 
     The center-body is modeled as a separate asb.Wing (symmetric=True)
@@ -348,7 +412,7 @@ def build_airplane(params: BWBParams, x_cg: float | None = None) -> asb.Airplane
     x_cg : float, optional
         CG x-position [m] from body LE. If None, uses fallback (0.30 × body chord).
     """
-    body_wing = _build_center_body(params)
+    body_wing = _build_center_body(params, duct_placement=duct_placement)
     outer_wing = _build_outer_wing(params)
 
     # CG reference: computed from component placement or fallback
@@ -376,7 +440,7 @@ def build_airplane(params: BWBParams, x_cg: float | None = None) -> asb.Airplane
     return airplane
 
 
-def _build_center_body(params: BWBParams) -> asb.Wing:
+def _build_center_body(params: BWBParams, duct_placement=None) -> asb.Wing:
     """Build center-body as a thick, swept, low-AR wing."""
     p = params
     body_chord = p.body_root_chord
@@ -394,6 +458,15 @@ def _build_center_body(params: BWBParams) -> asb.Wing:
     # Airfoil at blend: must match outer wing root Kulfan (C0 continuity)
     kaf_blend = build_kulfan_airfoil_at_station(p, 0.0, name="body_blend")
     af_blend = kaf_blend.to_airfoil()
+
+    # Apply duct bump to center and mid stations (blend is at wing root, no duct)
+    if duct_placement is not None:
+        bc = p.body_root_chord
+        mid_y = bw * 0.5
+        coords_c = apply_duct_bump(af_center.coordinates, duct_placement, bc, bw, 0.0)
+        af_center = asb.Airfoil(name="body_center_bump", coordinates=coords_c)
+        coords_m = apply_duct_bump(af_mid.coordinates, duct_placement, bc, bw, mid_y)
+        af_mid = asb.Airfoil(name="body_mid_bump", coordinates=coords_m)
 
     # Positions
     # Station 0 (centerline): y=0

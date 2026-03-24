@@ -96,6 +96,8 @@ class DuctAeroConfig:
     pr_nozzle: float = 0.96
     cd_intake_base: float = 0.05
     static_capture_factor: float = 1.2
+    k_base_te: float = 0.12
+    f_jet_recovery: float = 0.50
 
 
 @dataclass
@@ -171,7 +173,7 @@ def feasibility_from_config(cfg: dict) -> FeasibilityConfig:
                 "drag_margin", "vs_max", "cl_max_clean", "alpha_trim_max",
                 "elevon_deflection_max", "cl_beta_cn_beta_max",
                 "servo_torque_max_kgcm",
-                "manufacturability_min"]:
+                "manufacturability_min", "bump_max_mm"]:
         if key in f:
             kwargs[key] = f[key]
     # Map weight keys

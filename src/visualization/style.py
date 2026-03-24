@@ -38,8 +38,8 @@ COLORS = {
     "light": "#BDC3C7",          # Light gray
 
     # Propulsion
-    "thrust": "#27AE60",         # Green
-    "drag": "#E74C3C",           # Red
+    "thrust": "#27AE60",         # Green (thrust curves)
+    "drag": "#E74C3C",           # Red (drag curves)
     "duct": "#9B59B6",           # Purple
 
     # Components

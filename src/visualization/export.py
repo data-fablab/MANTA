@@ -52,8 +52,18 @@ def export_aircraft_stl(params: BWBParams, path: str, n_profile: int = 30,
     """
     p = params
 
+    # Compute duct placement for body bump (consistent with AVL model)
+    _duct_placement = None
+    if include_propulsion and edf is not None:
+        from ..propulsion.duct_geometry import compute_duct_placement
+        try:
+            _duct_placement = compute_duct_placement(p, edf)
+        except Exception:
+            pass
+
     # ── Build all sections: body (3) + wing (6) ──
-    body_sections, _ = _build_body_sections(p, n_profile)
+    body_sections, _ = _build_body_sections(p, n_profile,
+                                             duct_placement=_duct_placement)
     wing_sections = _build_wing_sections(p, n_profile)
 
     # Merge: body[0..2] + wing[1..5]  (wing[0] == body[-1] at blend)
@@ -112,7 +122,8 @@ def export_aircraft_stl(params: BWBParams, path: str, n_profile: int = 30,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _build_body_sections(params: BWBParams, n_profile: int,
-                         n_body_stations: int = 3) -> tuple[list[np.ndarray], list[float]]:
+                         n_body_stations: int = 3,
+                         duct_placement=None) -> tuple[list[np.ndarray], list[float]]:
     """Build 3D airfoil sections for the center body.
 
     Parameters
@@ -143,6 +154,14 @@ def _build_body_sections(params: BWBParams, n_profile: int,
         else:
             kaf = build_body_kulfan_at_station(p, frac, name=f"body_{frac:.0%}")
         coords_2d = kaf.to_airfoil(n_coordinates_per_side=n_profile).coordinates
+
+        # Apply duct bump if available (match AVL model)
+        if duct_placement is not None and frac < 1.0 - 1e-6:
+            from ..parameterization.bwb_aircraft import apply_duct_bump
+            coords_2d = apply_duct_bump(
+                coords_2d, duct_placement, p.body_root_chord,
+                p.body_halfwidth, frac * bw,
+            )
 
         x_local = coords_2d[:, 0] * chord
         z_local = coords_2d[:, 1] * chord

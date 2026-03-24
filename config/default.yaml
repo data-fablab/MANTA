@@ -36,6 +36,7 @@ feasibility:
   servo_torque_max_kgcm: 1.3   # max servo torque (Emax ES3004)
   # Manufacturability
   manufacturability_min: 0.25  # relaxed: composite expertise assumed
+  bump_max_mm: 8.0              # [mm] max dorsal duct bump height tolerable
   # Penalty weights
   weights:
     w_sm_lo: 20.0
@@ -54,6 +55,7 @@ feasibility:
     w_dutch_roll: 10.0
     w_manufacturability: 10.0
     w_servo_torque: 15.0
+    w_duct_bump: 20.0
 
 cg:
   battery_xc: 0.22
@@ -128,6 +130,8 @@ duct_aero:
   pr_nozzle: 0.96                # convergent nozzle with BL losses
   cd_intake_base: 0.05           # NACA flush intake drag coefficient
   static_capture_factor: 1.2     # fan_area × this for static capture
+  k_base_te: 0.12                # base drag coefficient for blunt TE (Hoerner)
+  f_jet_recovery: 0.50           # fraction of base drag recovered by jet wake filling
 
 # ── Structural mass model ──
 structure:

@@ -87,7 +87,14 @@ class AeroEvaluator:
             )
             x_cg = cg_result["x_cg"]
 
-        airplane = build_airplane(params, x_cg=x_cg)
+        # ── Duct placement (needed for body bump in AVL) ──
+        from ..propulsion.duct_geometry import compute_duct_placement as _cdp
+        try:
+            _duct_placement = _cdp(params, mission.edf)
+        except Exception:
+            _duct_placement = None
+
+        airplane = build_airplane(params, x_cg=x_cg, duct_placement=_duct_placement)
         s_ref = compute_wing_area(params)
         mac = compute_mac(params)
         ar = compute_aspect_ratio(params)
@@ -211,7 +218,16 @@ class AeroEvaluator:
             mission.kinematic_viscosity, s_ref,
         )
 
-        cd0 = cd0_wing + cd0_body + cd0_bump + cd_gear
+        # Nozzle base drag (TE slot)
+        from .drag import compute_nozzle_exit_drag
+        if _duct_placement is not None:
+            cd_nozzle = compute_nozzle_exit_drag(
+                _duct_placement.exhaust_width, _duct_placement.exhaust_height, s_ref,
+            )
+        else:
+            cd_nozzle = 0.0
+
+        cd0 = cd0_wing + cd0_body + cd0_bump + cd_gear + cd_nozzle
         e = oswald_efficiency(ar, params.le_sweep_deg, params.taper_ratio)
         cd_induced = cl**2 / (np.pi * ar * e) if ar > 1.0 else 0.1
 
@@ -236,10 +252,24 @@ class AeroEvaluator:
         fc = self.feasibility
         vs = mission.stall_speed(s_ref, fc.cl_max_clean)
 
-        # ── Propulsion balance ──
+        # ── Duct internal aero (pressure recovery) ──
+        pr_total = 1.0
+        if _duct_placement is not None:
+            from ..propulsion.duct_aero import compute_duct_aero
+            try:
+                _duct_aero = compute_duct_aero(
+                    _duct_placement, mission.edf, params,
+                    velocity=mission.velocity, rho=mission.density,
+                )
+                pr_total = _duct_aero.pr_total
+            except Exception:
+                pass
+
+        # ── Propulsion balance (installed thrust) ──
         drag_force = cd_effective * mission.dynamic_pressure * s_ref
         prop = compute_propulsion_balance(drag_force, mission.velocity,
-                                          mission.edf, mission.battery)
+                                          mission.edf, mission.battery,
+                                          pr_total=pr_total)
         t_available = prop["T_available"]
         t_over_d = prop["T_over_D"]
         endurance_s = prop["endurance_s"]
@@ -263,6 +293,7 @@ class AeroEvaluator:
             cl_beta=cl_beta,
             manufacturability_score=manuf_score,
             servo_torque_kgcm=servo_torque_kgcm,
+            bump_height_mm=bump["max_height_mm"],
         )
         penalty, constraints = fc.compute_penalty(
             static_margin, cm, struct_mass, mission.mass_budget,
@@ -273,6 +304,7 @@ class AeroEvaluator:
             cl_beta=cl_beta,
             manufacturability_score=manuf_score,
             servo_torque_kgcm=servo_torque_kgcm,
+            bump_height_mm=bump["max_height_mm"],
         )
 
         result = {
@@ -330,6 +362,8 @@ class AeroEvaluator:
             "CD_intake": cd_intake,
             "CD_gear": cd_gear,
             "CD0_bump": cd0_bump,
+            "CD_nozzle": cd_nozzle,
+            "pr_total": pr_total,
             "bump_max_height_mm": bump["max_height_mm"],
             # Feasibility
             "is_feasible": is_feasible,

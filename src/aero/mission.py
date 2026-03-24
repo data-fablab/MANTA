@@ -126,6 +126,7 @@ class FeasibilityConfig:
 
     # ── Manufacturability constraint ──
     manufacturability_min: float = 0.40  # min composite score [0-1]
+    bump_max_mm: float = 8.0             # [mm] max dorsal duct bump height
 
     # ── Aerodynamic penalty weights ──
     w_sm_lo: float = 20.0
@@ -148,6 +149,7 @@ class FeasibilityConfig:
     w_dutch_roll: float = 10.0    # Cl_beta/Cn_beta ratio (lateral coupling)
     w_servo_torque: float = 15.0  # servo torque exceeds spec
     w_manufacturability: float = 10.0  # manufacturability score too low
+    w_duct_bump: float = 20.0          # duct bump exceeds max height
 
     def compute_penalty(
         self,
@@ -167,6 +169,7 @@ class FeasibilityConfig:
         cl_beta: float | None = None,
         manufacturability_score: float | None = None,
         servo_torque_kgcm: float | None = None,
+        bump_height_mm: float | None = None,
     ) -> tuple[float, dict]:
         """Compute total penalty and constraint violations.
 
@@ -261,6 +264,12 @@ class FeasibilityConfig:
             penalty += self.w_manufacturability * max(0, g_manuf / max(self.manufacturability_min, 0.01))
             constraints["g_manufacturability"] = g_manuf
 
+        # ── Duct bump constraint ──
+        if bump_height_mm is not None:
+            g_bump = bump_height_mm - self.bump_max_mm
+            penalty += self.w_duct_bump * max(0, g_bump / max(self.bump_max_mm, 1.0))
+            constraints["g_bump"] = g_bump
+
         return penalty, constraints
 
     def is_feasible(
@@ -282,6 +291,7 @@ class FeasibilityConfig:
         cl_beta: float | None = None,
         manufacturability_score: float | None = None,
         servo_torque_kgcm: float | None = None,
+        bump_height_mm: float | None = None,
     ) -> bool:
         """Check if all constraints are satisfied."""
         checks = [
@@ -312,6 +322,8 @@ class FeasibilityConfig:
             checks.append(servo_torque_kgcm <= self.servo_torque_max_kgcm)
         if manufacturability_score is not None:
             checks.append(manufacturability_score >= self.manufacturability_min)
+        if bump_height_mm is not None:
+            checks.append(bump_height_mm <= self.bump_max_mm)
         return all(checks)
 
 

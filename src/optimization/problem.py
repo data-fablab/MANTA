@@ -467,10 +467,17 @@ def run_nsga2_assisted(
         print(flush=True)
 
     # --- Phase 1: NSGA-II on surrogate ---
+    _constr_keys = [
+        "g_sm_lo", "g_sm_hi", "g_td", "g_endurance", "g_vs",
+        "g_elevon_defl", "g_cn_beta", "g_ar", "g_volume",
+        "g_manufacturability", "g_servo_torque",
+    ]
+    _n_constr = len(_constr_keys)
+
     class BWBProblem(ElementwiseProblem):
         def __init__(self):
             super().__init__(
-                n_var=N_VARS, n_obj=n_obj, n_ieq_constr=1,
+                n_var=N_VARS, n_obj=n_obj, n_ieq_constr=_n_constr,
                 xl=lb, xu=ub,
             )
 
@@ -482,7 +489,9 @@ def run_nsga2_assisted(
                 val = r[d["key"]]
                 f.append(-val if d["sense"] == "max" else val)
             out["F"] = f
-            out["G"] = [r["penalty"] - 0.01]
+            # Individual constraints: g_i <= 0 means satisfied
+            constraints = r.get("constraints", {})
+            out["G"] = [constraints.get(k, 0.0) for k in _constr_keys]
 
     if verbose:
         print("Phase 1: Running NSGA-II on surrogate...", flush=True)
@@ -517,7 +526,9 @@ def run_nsga2_assisted(
         if verbose:
             print("  No Pareto solutions found!")
         return {"pareto_X": None, "pareto_F": None,
-                "avl_results": [], "best_per_objective": {},
+                "avl_X": None, "avl_F": None,
+                "avl_results": [], "avl_feasible_mask": np.array([], dtype=bool),
+                "best_per_objective": {},
                 "objectives": objectives, "obj_defs": obj_defs,
                 "n_pareto": 0, "n_feasible": 0}
 

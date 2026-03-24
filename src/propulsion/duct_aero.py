@@ -111,14 +111,23 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
         )
 
     # ── Intake pressure recovery ──
-    # NACA flush intake: PR ≈ 0.92-0.97 depending on BL thickness
-    # Conservative estimate for thick BL on BWB upper surface
-    pr_intake = config.pr_intake
+    # NACA flush intake: PR depends on BL state (Re-dependent).
+    # At Re < 200k (typical for small UAV at 25 m/s, 0.1 m scale),
+    # BL is transitional → lower PR than high-Re NACA data.
+    # Ref: Seddon & Goldsmith, ch. 4 (flush intake correlation)
+    intake_chord = placement.intake_length
+    re_intake = velocity * intake_chord / (MU_SEA_LEVEL / rho) if velocity > 0.5 else 0
+    if re_intake > 5e5:
+        pr_intake = config.pr_intake  # turbulent BL: use configured value
+    elif re_intake > 1e5:
+        pr_intake = config.pr_intake - 0.02  # transitional: slight penalty
+    else:
+        pr_intake = config.pr_intake - 0.04  # laminar/low Re: more loss
 
     # ── S-duct pressure recovery ──
-    # Seddon & Goldsmith correlation: dp/q = K * (offset/L)^2
-    # K ≈ 0.10-0.20 for well-designed S-ducts
-    sduct_offset = abs(placement.intake_z - placement.fan_z)
+    # Seddon & Goldsmith: dp/q = K × (offset/L)²
+    # S-duct starts at bottom of intake ramp, not at OML surface
+    sduct_offset = abs((placement.intake_z - placement.intake_depth) - placement.fan_z)
     sduct_length = abs(placement.fan_x - (placement.intake_x + placement.intake_length))
     sduct_length = max(sduct_length, 0.01)  # avoid division by zero
 

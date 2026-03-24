@@ -23,6 +23,16 @@ _TEMPLATE_LOWER = np.array([
 ])
 _FREE_INDICES = [2, 6, 7]  # optimizer-controlled Kulfan indices
 
+# Body Kulfan templates (thick reflex airfoil, ~18% t/c baseline)
+# Thicker than wing template to accommodate 12-25% t/c range.
+_BODY_TEMPLATE_UPPER = np.array([
+    0.2640, 0.2880, 0.4560, 0.2160, 0.3840, 0.3000, 0.2400, 0.2160,
+])
+_BODY_TEMPLATE_LOWER = np.array([
+    -0.2520, -0.1800, -0.0720, -0.1800, -0.0840, -0.0720, -0.0360, -0.0120,
+])
+_BODY_FREE_INDICES = [2, 6, 7]  # same indices as wing
+
 # Outer wing stations (fraction of outer half-span)
 # Aligned with dihedral breaks + control surface boundaries:
 #   0.00  elevon inboard start (blend)
@@ -122,6 +132,157 @@ def build_kulfan_airfoil_at_station(
     return build_kulfan_airfoil(u2, u6, u7, l2, l6, l7, name=name)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Body Kulfan airfoil construction (thick center-body)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_body_kulfan_weights(u2, u6, u7, l2, l6, l7):
+    """Build full 8-weight arrays from 3 free body weights per surface."""
+    upper = _BODY_TEMPLATE_UPPER.copy()
+    lower = _BODY_TEMPLATE_LOWER.copy()
+    upper[_BODY_FREE_INDICES[0]] = u2
+    upper[_BODY_FREE_INDICES[1]] = u6
+    upper[_BODY_FREE_INDICES[2]] = u7
+    lower[_BODY_FREE_INDICES[0]] = l2
+    lower[_BODY_FREE_INDICES[1]] = l6
+    lower[_BODY_FREE_INDICES[2]] = l7
+    return upper, lower
+
+
+def build_body_kulfan_airfoil(u2, u6, u7, l2, l6, l7,
+                               name="body_kulfan") -> asb.KulfanAirfoil:
+    """Build thick body KulfanAirfoil from reduced design variables."""
+    upper, lower = _build_body_kulfan_weights(u2, u6, u7, l2, l6, l7)
+    return asb.KulfanAirfoil(
+        name=name,
+        upper_weights=upper,
+        lower_weights=lower,
+        leading_edge_weight=0.25,  # larger than wing (0.16) for thicker LE
+        TE_thickness=0.0,
+    )
+
+
+def body_tc_from_kulfan(u2, u6, u7, l2, l6, l7) -> float:
+    """Extract effective t/c from body Kulfan weights.
+
+    Used by downstream code (drag, CG, features) as drop-in
+    replacement for the old params.body_tc_root field.
+    """
+    kaf = build_body_kulfan_airfoil(u2, u6, u7, l2, l6, l7)
+    return float(kaf.max_thickness())
+
+
+def body_height_at_xc(params: 'BWBParams', x_frac: float) -> float:
+    """Body airfoil thickness at arbitrary x/c, as a chord fraction.
+
+    Evaluates the centerline body Kulfan CST at a single chordwise station.
+    """
+    kaf = build_body_kulfan_airfoil(
+        params.body_kulfan_u2, params.body_kulfan_u6, params.body_kulfan_u7,
+        params.body_kulfan_l2, params.body_kulfan_l6, params.body_kulfan_l7,
+    )
+    coords = kaf.to_airfoil(n_coordinates_per_side=80).coordinates
+    x_pts = coords[:, 0]
+    z_pts = coords[:, 1]
+    n = len(x_pts) // 2
+    # Upper surface: first n+1 points (from TE to LE to TE), reversed
+    x_up = x_pts[:n + 1][::-1]
+    z_up = z_pts[:n + 1][::-1]
+    x_lo = x_pts[n:]
+    z_lo = z_pts[n:]
+    z_upper = float(np.interp(x_frac, x_up, z_up))
+    z_lower = float(np.interp(x_frac, x_lo, z_lo))
+    return z_upper - z_lower
+
+
+def vectorized_body_tc_at_xc(
+    body_u2: np.ndarray, body_u6: np.ndarray, body_u7: np.ndarray,
+    body_l2: np.ndarray, body_l6: np.ndarray, body_l7: np.ndarray,
+    x_frac: float,
+) -> np.ndarray:
+    """Evaluate body airfoil t/c at arbitrary x/c, vectorized over N designs.
+
+    Uses the Kulfan CST class function analytically:
+        z(x) = x^0.5 * (1-x) * Σ(w_i * C(n,i) * x^i * (1-x)^(n-i))
+    where C(n,i) are binomial coefficients and n=7 (order 8 Bernstein).
+    """
+    n_order = 7  # degree = len(weights) - 1
+    # Binomial coefficients C(7, i) for i=0..7
+    binom_coeffs = np.array([1, 7, 21, 35, 35, 21, 7, 1], dtype=float)
+
+    # Bernstein basis at x_frac (same for all designs)
+    x = x_frac
+    basis = binom_coeffs * (x ** np.arange(8)) * ((1 - x) ** np.arange(n_order, -1, -1))
+
+    # Class function: x^0.5 * (1-x)
+    class_fn = x ** 0.5 * (1 - x)
+
+    # Build full 8-weight arrays for N designs
+    # Template values are broadcast, free indices overwritten
+    N = len(body_u2)
+    upper_w = np.tile(_BODY_TEMPLATE_UPPER, (N, 1))  # (N, 8)
+    lower_w = np.tile(_BODY_TEMPLATE_LOWER, (N, 1))
+    upper_w[:, _BODY_FREE_INDICES[0]] = body_u2
+    upper_w[:, _BODY_FREE_INDICES[1]] = body_u6
+    upper_w[:, _BODY_FREE_INDICES[2]] = body_u7
+    lower_w[:, _BODY_FREE_INDICES[0]] = body_l2
+    lower_w[:, _BODY_FREE_INDICES[1]] = body_l6
+    lower_w[:, _BODY_FREE_INDICES[2]] = body_l7
+
+    # z_upper = class_fn * dot(upper_w, basis), z_lower = class_fn * dot(lower_w, basis)
+    z_upper = class_fn * (upper_w @ basis)  # (N,)
+    z_lower = class_fn * (lower_w @ basis)  # (N,)
+
+    return z_upper - z_lower  # t/c at x_frac
+
+
+def build_body_kulfan_at_station(params: 'BWBParams', frac: float,
+                                  name: str = "body_s") -> asb.KulfanAirfoil:
+    """Build body Kulfan airfoil at a spanwise station within the center-body.
+
+    frac=0.0 → centerline (pure body Kulfan)
+    frac=1.0 → blend station (pure wing root Kulfan, for C0 continuity)
+
+    Interpolates both the free weights and the template weights between
+    body and wing templates.
+    """
+    p = params
+    # Body center weights
+    bu2, bu6, bu7 = p.body_kulfan_u2, p.body_kulfan_u6, p.body_kulfan_u7
+    bl2, bl6, bl7 = p.body_kulfan_l2, p.body_kulfan_l6, p.body_kulfan_l7
+    # Wing root weights
+    wu2, wu6, wu7 = p.kulfan_root_u2, p.kulfan_root_u6, p.kulfan_root_u7
+    wl2, wl6, wl7 = p.kulfan_root_l2, p.kulfan_root_l6, p.kulfan_root_l7
+
+    # Interpolate free weights
+    u2 = bu2 * (1 - frac) + wu2 * frac
+    u6 = bu6 * (1 - frac) + wu6 * frac
+    u7 = bu7 * (1 - frac) + wu7 * frac
+    l2 = bl2 * (1 - frac) + wl2 * frac
+    l6 = bl6 * (1 - frac) + wl6 * frac
+    l7 = bl7 * (1 - frac) + wl7 * frac
+
+    # Interpolate full template arrays
+    upper = _BODY_TEMPLATE_UPPER * (1 - frac) + _TEMPLATE_UPPER * frac
+    lower = _BODY_TEMPLATE_LOWER * (1 - frac) + _TEMPLATE_LOWER * frac
+    upper[_BODY_FREE_INDICES[0]] = u2
+    upper[_BODY_FREE_INDICES[1]] = u6
+    upper[_BODY_FREE_INDICES[2]] = u7
+    lower[_BODY_FREE_INDICES[0]] = l2
+    lower[_BODY_FREE_INDICES[1]] = l6
+    lower[_BODY_FREE_INDICES[2]] = l7
+
+    le_weight = 0.25 * (1 - frac) + 0.16 * frac
+
+    return asb.KulfanAirfoil(
+        name=name,
+        upper_weights=upper,
+        lower_weights=lower,
+        leading_edge_weight=le_weight,
+        TE_thickness=0.0,
+    )
+
+
 def flatten_airfoil_aft(coords_2d: np.ndarray, x_hinge: float = 0.75) -> np.ndarray:
     """Replace the aft section of an airfoil with straight lines.
 
@@ -168,83 +329,6 @@ def flatten_airfoil_aft(coords_2d: np.ndarray, x_hinge: float = 0.75) -> np.ndar
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Body airfoil construction (thick, non-Kulfan)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def build_body_airfoil(
-    tc: float, camber: float, reflex: float, le_droop: float,
-    name: str = "body", n_pts: int = 80,
-) -> asb.Airfoil:
-    """Build a thick body airfoil from direct geometric parameters.
-
-    Uses NACA 4-digit thickness distribution + parametric camber line.
-    Suitable for t/c up to 25% where Kulfan CST becomes unreliable.
-
-    Parameters
-    ----------
-    tc : float      — max thickness-to-chord (0.12 to 0.25)
-    camber : float  — max camber (0.01 to 0.06)
-    reflex : float  — TE reflex: upward deflection of aft 30% camber line
-    le_droop : float — LE radius weight (controls nose rounding)
-    """
-    x = _cosine_spacing(n_pts)
-
-    # NACA 4-digit thickness distribution, scaled to desired t/c
-    # y_t = (t/0.2) * [0.2969√x - 0.1260x - 0.3516x² + 0.2843x³ - 0.1015x⁴]
-    yt = (tc / 0.20) * (
-        0.2969 * np.sqrt(np.maximum(x, 0))
-        - 0.1260 * x
-        - 0.3516 * x**2
-        + 0.2843 * x**3
-        - 0.1015 * x**4
-    )
-
-    # LE droop: modify the first term coefficient for more/less LE radius
-    # Default NACA coefficient is 0.2969; le_droop scales it
-    le_factor = le_droop / 0.16  # normalized to default
-    yt_le_correction = (le_factor - 1.0) * 0.2969 * np.sqrt(np.maximum(x, 0)) * (tc / 0.20)
-    yt += yt_le_correction * np.exp(-8 * x)  # only affects LE region
-
-    # Camber line: parabolic with reflex
-    # Base camber: max at ~40% chord
-    yc = 4 * camber * x * (1 - x)
-
-    # Reflex: deflect aft 30% upward (pitch-up moment)
-    reflex_start = 0.70
-    mask = x > reflex_start
-    reflex_x = (x[mask] - reflex_start) / (1.0 - reflex_start)
-    yc[mask] += reflex * reflex_x**2
-
-    # Combine: upper = camber + thickness, lower = camber - thickness
-    xu = x
-    yu = yc + yt
-    xl = x
-    yl = yc - yt
-
-    # Smooth TE closure: blend to y=0 over last 5% chord
-    # Avoids the sharp corner caused by reflex + forced closure
-    te_blend_start = 0.95
-    te_mask = x > te_blend_start
-    te_frac = (x[te_mask] - te_blend_start) / (1.0 - te_blend_start)  # 0→1
-    blend = (1.0 - te_frac ** 2)  # smooth ramp to 0
-    yu[te_mask] *= blend
-    yl[te_mask] *= blend
-
-    # Assemble in Selig format (upper TE→LE then lower LE→TE)
-    coords_upper = np.column_stack([xu[::-1], yu[::-1]])
-    coords_lower = np.column_stack([xl[1:], yl[1:]])  # skip duplicate LE
-    coordinates = np.vstack([coords_upper, coords_lower])
-
-    return asb.Airfoil(name=name, coordinates=coordinates)
-
-
-def _cosine_spacing(n: int) -> np.ndarray:
-    """Cosine-spaced x/c from 0 to 1 (denser at LE and TE)."""
-    beta = np.linspace(0, np.pi, n)
-    return 0.5 * (1 - np.cos(beta))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Aircraft assembly
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -282,7 +366,7 @@ def build_airplane(params: BWBParams, x_cg: float | None = None) -> asb.Airplane
     span = 2 * params.half_span
     c = s / span  # mean geometric chord
     airplane = asb.Airplane(
-        name="nEUROn BWB v2",
+        name="MANTA BWB",
         xyz_ref=[x_ref, 0, 0],
         s_ref=s,
         c_ref=c,
@@ -301,23 +385,13 @@ def _build_center_body(params: BWBParams) -> asb.Wing:
     body_sweep = np.radians(p.body_sweep_deg)
     bw = p.body_halfwidth
 
-    # Airfoil at centerline: thick body airfoil
-    af_center = build_body_airfoil(
-        tc=p.body_tc_root, camber=p.body_camber,
-        reflex=p.body_reflex, le_droop=p.body_le_droop,
-        name="body_center",
-    )
+    # Airfoil at centerline: thick body Kulfan
+    af_center = build_body_kulfan_at_station(p, 0.0, name="body_center").to_airfoil()
 
-    # Airfoil at mid-body: interpolated
-    mid_tc = p.body_tc_root * 0.7 + 0.3 * 0.105  # blend toward wing
-    mid_camber = p.body_camber * 0.7 + 0.3 * 0.024
-    af_mid = build_body_airfoil(
-        tc=mid_tc, camber=mid_camber,
-        reflex=p.body_reflex * 0.5, le_droop=p.body_le_droop * 0.8,
-        name="body_mid",
-    )
+    # Airfoil at mid-body: interpolated body→wing Kulfan (frac=0.5)
+    af_mid = build_body_kulfan_at_station(p, 0.5, name="body_mid").to_airfoil()
 
-    # Airfoil at blend: must match outer wing root Kulfan
+    # Airfoil at blend: must match outer wing root Kulfan (C0 continuity)
     kaf_blend = build_kulfan_airfoil_at_station(p, 0.0, name="body_blend")
     af_blend = kaf_blend.to_airfoil()
 

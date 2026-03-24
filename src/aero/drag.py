@@ -136,6 +136,45 @@ def compute_body_cd0(
     return cd0_body
 
 
+def compute_bump_cd0(
+    bump_max_height_m: float,
+    bump_length_m: float,
+    bump_width_m: float,
+    velocity: float,
+    kinematic_viscosity: float,
+    s_ref: float,
+) -> float:
+    """CD0 increment from dorsal bump fairing over the duct.
+
+    Uses Hoerner streamlined-body form factor for a protuberance
+    on a flat surface (Fluid-Dynamic Drag, Ch. 6).
+
+    ff_bump = 1 + 1.5*(h/l)^1.5 + 7*(h/l)^3
+
+    Wetted area ≈ half-ellipsoid top + sides.
+    """
+    if bump_max_height_m <= 0 or bump_length_m <= 0:
+        return 0.0
+
+    h, l, w = bump_max_height_m, bump_length_m, bump_width_m
+    hl = h / max(l, 1e-6)
+
+    # Skin friction on bump surface
+    re_bump = velocity * l / max(kinematic_viscosity, 1e-9)
+    if re_bump > 5e5:
+        cf = 0.455 / (np.log10(max(re_bump, 10)) ** 2.58)
+    else:
+        cf = 1.328 / np.sqrt(max(re_bump, 1e3))
+
+    # Hoerner form factor for streamlined protuberance
+    ff = 1.0 + 1.5 * hl ** 1.5 + 7.0 * hl ** 3.0
+
+    # Wetted area: half-ellipsoid top + two side faces
+    s_wet = np.pi * h * l / 2.0 + 2.0 * h * w
+
+    return float(cf * ff * s_wet / max(s_ref, 1e-6))
+
+
 def estimate_parasite_drag(params: BWBParams, velocity: float,
                            kinematic_viscosity: float) -> float:
     """Quick analytical CD0 estimate (fallback). Full aircraft."""

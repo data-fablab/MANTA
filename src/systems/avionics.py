@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..parameterization.design_variables import BWBParams
-from ..parameterization.bwb_aircraft import build_body_airfoil
+from ..parameterization.bwb_aircraft import build_body_kulfan_at_station
 
 
 @dataclass
@@ -207,12 +207,8 @@ def compute_component_positions_3d(
     bc = p.body_root_chord  # body chord [m]
 
     # Build body airfoil for envelope check
-    af = build_body_airfoil(
-        tc=p.body_tc_root, camber=p.body_camber,
-        reflex=p.body_reflex, le_droop=p.body_le_droop,
-        n_pts=200,
-    )
-    coords = af.coordinates
+    kaf = build_body_kulfan_at_station(p, 0.0, name="body_envelope")
+    coords = kaf.to_airfoil(n_coordinates_per_side=100).coordinates
     mid_idx = np.argmin(coords[:, 0])
     upper_x = coords[:mid_idx + 1, 0][::-1]
     upper_z = coords[:mid_idx + 1, 1][::-1]

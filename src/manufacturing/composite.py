@@ -370,7 +370,7 @@ MANUFACTURING PROCEDURE — Moule femelle + prépreg carbone
 ══════════════════════════════════════════════════════════
 
 Phase 1 — Outillage (1-2 semaines)
-  1. Exporter STEP OML depuis le pipeline (export_aircraft_step)
+  1. Exporter STL OML depuis le pipeline (export_aircraft_stl)
   2. Usiner moules femelles CNC (MDF 30mm ou tooling board Cibatool)
      - 2 demi-coques body (extrados/intrados), plan de joint au plan de symétrie
      - 2 demi-coques aile droite (extrados/intrados)

@@ -5,6 +5,7 @@ from .design_variables import (
 from .bwb_aircraft import (
     build_airplane, compute_wing_area, compute_aspect_ratio, compute_mac,
     compute_internal_volume, estimate_structural_mass,
-    build_body_airfoil, build_kulfan_airfoil_at_station,
+    build_body_kulfan_airfoil, body_tc_from_kulfan,
+    build_body_kulfan_at_station, build_kulfan_airfoil_at_station,
     OUTER_WING_STATIONS, N_OUTER_SEGMENTS, BODY_STATIONS,
 )

@@ -1,10 +1,12 @@
-"""Feature augmentation for 30-variable BWB design space.
+"""Feature augmentation for 32-variable BWB design space.
 
-Takes (N, 30) raw design vectors and appends ~22 derived geometric features,
+Takes (N, 32) raw design vectors and appends 20 derived geometric features,
 producing (N, 52) augmented feature matrices for the surrogate MLP.
 """
 
 import numpy as np
+
+from ..parameterization.bwb_aircraft import vectorized_body_tc_at_xc
 
 # ---------------------------------------------------------------------------
 # Design variable indices (matching VAR_NAMES in design_variables.py)
@@ -16,47 +18,46 @@ _IDX_LE_SWEEP_DEG = 3
 
 _IDX_BODY_CHORD_RATIO = 4
 _IDX_BODY_HALFWIDTH = 5
-_IDX_BODY_TC_ROOT = 6
-_IDX_BODY_CAMBER = 7
-_IDX_BODY_REFLEX = 8
-_IDX_BODY_TWIST = 9
-_IDX_BODY_SWEEP_DELTA = 10
-_IDX_BODY_LE_DROOP = 11
+_IDX_BODY_KU_U2 = 6
+_IDX_BODY_KU_U6 = 7
+_IDX_BODY_KU_U7 = 8
+_IDX_BODY_KU_L2 = 9
+_IDX_BODY_KU_L6 = 10
+_IDX_BODY_KU_L7 = 11
+_IDX_BODY_TWIST = 12
+_IDX_BODY_SWEEP_DELTA = 13
 
-_IDX_TWIST = slice(12, 17)       # twist_1 .. twist_tip
-_IDX_TWIST_TIP = 16
+_IDX_TWIST = slice(14, 19)       # twist_1 .. twist_tip
+_IDX_TWIST_TIP = 18
 
-_IDX_DIHEDRAL = slice(17, 22)    # dihedral_0 .. dihedral_tip
+_IDX_DIHEDRAL = slice(19, 24)    # dihedral_0 .. dihedral_tip
 
-_IDX_KU_ROOT_U2 = 22
-_IDX_KU_ROOT_U6 = 23
-_IDX_KU_ROOT_U7 = 24
-_IDX_KU_ROOT_L2 = 25
-_IDX_KU_ROOT_L6 = 26
-_IDX_KU_ROOT_L7 = 27
-_IDX_KU_TIP_DELTA_TC = 28
-_IDX_KU_TIP_DELTA_CAMBER = 29
+_IDX_KU_ROOT_U2 = 24
+_IDX_KU_ROOT_U6 = 25
+_IDX_KU_ROOT_U7 = 26
+_IDX_KU_ROOT_L2 = 27
+_IDX_KU_ROOT_L6 = 28
+_IDX_KU_ROOT_L7 = 29
+_IDX_KU_TIP_DELTA_TC = 30
+_IDX_KU_TIP_DELTA_CAMBER = 31
 
 # Outer wing dihedral segment fractions (sum = 1.0)
 _DIHEDRAL_SEGMENTS = np.array([0.25, 0.25, 0.25, 0.15, 0.10])
 
+_EDF_DUCT_OD = 0.078  # [m] EDF 70mm duct outer diameter (for duct ratio feature)
+
 
 def augment_features(X: np.ndarray) -> np.ndarray:
-    """Append 19 derived geometric features to raw 30-var input -> (N, 49).
-
-    Removed 3 features that were near-perfect duplicates (|r|>0.99):
-    - taper_elliptic_dev  ≡ |taper_ratio - 0.4|  (r=-1.0 with taper_ratio)
-    - total_twist         ≡ twist_tip             (r=+1.0 with twist_tip)
-    - blend_tc_mismatch   ≡ |body_tc - 0.105|     (r=+1.0 with body_tc_root)
+    """Append 20 derived geometric features to raw 32-var input -> (N, 52).
 
     Parameters
     ----------
-    X : np.ndarray, shape (N, 30)
+    X : np.ndarray, shape (N, 32)
         Raw design vectors.
 
     Returns
     -------
-    np.ndarray, shape (N, 49)
+    np.ndarray, shape (N, 52)
         Augmented feature matrix.
     """
     # --- Extract raw variables ---
@@ -67,8 +68,14 @@ def augment_features(X: np.ndarray) -> np.ndarray:
 
     bcr = X[:, _IDX_BODY_CHORD_RATIO]
     bw = X[:, _IDX_BODY_HALFWIDTH]
-    btc = X[:, _IDX_BODY_TC_ROOT]
     bsd = X[:, _IDX_BODY_SWEEP_DELTA]
+
+    # Body t/c at max-thickness station (x/c=0.30) from CST evaluation
+    btc = np.clip(vectorized_body_tc_at_xc(
+        X[:, _IDX_BODY_KU_U2], X[:, _IDX_BODY_KU_U6], X[:, _IDX_BODY_KU_U7],
+        X[:, _IDX_BODY_KU_L2], X[:, _IDX_BODY_KU_L6], X[:, _IDX_BODY_KU_L7],
+        x_frac=0.30,
+    ), 0.10, 0.30)
 
     twists = X[:, _IDX_TWIST]
     twist_tip = X[:, _IDX_TWIST_TIP]
@@ -93,7 +100,7 @@ def augment_features(X: np.ndarray) -> np.ndarray:
     # Mean aerodynamic chord (outer wing)
     mac = (2 / 3) * rc * (1 + tr + tr ** 2) / (1 + tr)
 
-    # Twist features (total_twist removed: identical to twist_tip which is already in X)
+    # Twist features
     twist_gradient = twist_tip / np.maximum(outer_span, 1e-6)
     mean_twist = twists.mean(axis=1)
 
@@ -116,8 +123,6 @@ def augment_features(X: np.ndarray) -> np.ndarray:
     ac_offset = 0.25 * mac + (outer_span / 3) * (1 + 2 * tr) / (1 + tr) * np.tan(sweep_rad)
 
     # Body-derived features
-    # (taper_elliptic_dev removed: r=-1.0 with taper_ratio)
-    # (blend_tc_mismatch removed: r=+1.0 with body_tc_root)
     body_volume = body_root_chord * btc * bw * (np.pi / 4) * 0.6
     body_frontal_area = body_root_chord * btc
     body_wetted_area = 2.05 * (body_root_chord + rc) * bw
@@ -129,25 +134,34 @@ def augment_features(X: np.ndarray) -> np.ndarray:
     # Span-body ratio
     span_body_ratio = bw / np.maximum(hs, 1e-6)
 
+    # Duct-body coupling: body height at fan station (x/c=0.40) vs duct OD
+    btc_fan = vectorized_body_tc_at_xc(
+        X[:, _IDX_BODY_KU_U2], X[:, _IDX_BODY_KU_U6], X[:, _IDX_BODY_KU_U7],
+        X[:, _IDX_BODY_KU_L2], X[:, _IDX_BODY_KU_L6], X[:, _IDX_BODY_KU_L7],
+        x_frac=0.40,
+    )
+    body_height_fan_ratio = btc_fan * body_root_chord / _EDF_DUCT_OD
+
     return np.column_stack([
         X,
-        wing_area,              # 30
-        aspect_ratio,           # 31
-        mac,                    # 32
-        tip_chord,              # 33
-        body_root_chord,        # 34
-        outer_span,             # 35
-        twist_gradient,         # 36
-        mean_twist,             # 37
-        effective_span,         # 38
-        qc_sweep,               # 39
-        reflex_root,            # 40
-        camber_root,            # 41
-        ac_offset,              # 42
-        body_volume,            # 43
-        body_frontal_area,      # 44
-        body_wetted_area,       # 45
-        body_aspect_ratio,      # 46
-        body_sweep_total,       # 47
-        span_body_ratio,        # 48
+        wing_area,              # 32
+        aspect_ratio,           # 33
+        mac,                    # 34
+        tip_chord,              # 35
+        body_root_chord,        # 36
+        outer_span,             # 37
+        twist_gradient,         # 38
+        mean_twist,             # 39
+        effective_span,         # 40
+        qc_sweep,               # 41
+        reflex_root,            # 42
+        camber_root,            # 43
+        ac_offset,              # 44
+        body_volume,            # 45
+        body_frontal_area,      # 46
+        body_wetted_area,       # 47
+        body_aspect_ratio,      # 48
+        body_sweep_total,       # 49
+        span_body_ratio,        # 50
+        body_height_fan_ratio,  # 51
     ])

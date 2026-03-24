@@ -14,25 +14,37 @@ import numpy as np
 from ..parameterization.design_variables import BWBParams, params_from_vector
 from ..aero.mission import MissionCondition, FeasibilityConfig, DEFAULT_FEASIBILITY
 from ..aero.drag import oswald_efficiency
-from ..propulsion.edf_model import thrust_at_speed, duct_fits_in_body, intake_drag
 from ..systems.cg import CGConfig, DEFAULT_CG_CONFIG
+from ..parameterization.bwb_aircraft import vectorized_body_tc_at_xc
 
-# Design-vector indices (match design_variables.py)
+# Design-vector indices (match design_variables.py — 32 variables)
 _IDX_HALF_SPAN = 0
 _IDX_WING_ROOT_CHORD = 1
 _IDX_TAPER = 2
 _IDX_SWEEP = 3
 _IDX_BODY_CHORD_RATIO = 4
 _IDX_BODY_HALFWIDTH = 5
-_IDX_BODY_TC_ROOT = 6
-_IDX_BODY_CAMBER = 7
-_IDX_BODY_REFLEX = 8
-_IDX_BODY_TWIST = 9
-_IDX_BODY_SWEEP_DELTA = 10
-_IDX_TWIST_1 = 12
-_IDX_TWIST_TIP = 16
-_IDX_DIHEDRAL_0 = 17
-_IDX_DIHEDRAL_TIP = 21
+_IDX_BODY_KU_U2 = 6
+_IDX_BODY_KU_U6 = 7
+_IDX_BODY_KU_U7 = 8
+_IDX_BODY_KU_L2 = 9
+_IDX_BODY_KU_L6 = 10
+_IDX_BODY_KU_L7 = 11
+_IDX_BODY_TWIST = 12
+_IDX_BODY_SWEEP_DELTA = 13
+_IDX_TWIST_1 = 14
+_IDX_TWIST_TIP = 18
+_IDX_DIHEDRAL_0 = 19
+_IDX_DIHEDRAL_TIP = 23
+
+
+def _body_tc_from_x(x: np.ndarray, x_frac: float = 0.30) -> np.ndarray:
+    """Extract body t/c at arbitrary x/c from design vector, vectorized."""
+    return vectorized_body_tc_at_xc(
+        x[:, _IDX_BODY_KU_U2], x[:, _IDX_BODY_KU_U6], x[:, _IDX_BODY_KU_U7],
+        x[:, _IDX_BODY_KU_L2], x[:, _IDX_BODY_KU_L6], x[:, _IDX_BODY_KU_L7],
+        x_frac,
+    )
 
 
 # ── Fast vectorized geometry ────────────────────────────────────────────────
@@ -54,7 +66,7 @@ def _fast_structural_mass(x: np.ndarray, mtow: float) -> np.ndarray:
     tr = x[:, _IDX_TAPER]
     bcr = x[:, _IDX_BODY_CHORD_RATIO]
     bw = x[:, _IDX_BODY_HALFWIDTH]
-    btc = x[:, _IDX_BODY_TC_ROOT]
+    btc = np.clip(_body_tc_from_x(x, 0.30), 0.10, 0.30)
 
     tip_chord = rc * tr
     body_root_chord = rc * bcr
@@ -91,7 +103,7 @@ def _fast_internal_volume(x: np.ndarray) -> np.ndarray:
     rc = x[:, _IDX_WING_ROOT_CHORD]
     bcr = x[:, _IDX_BODY_CHORD_RATIO]
     bw = x[:, _IDX_BODY_HALFWIDTH]
-    btc = x[:, _IDX_BODY_TC_ROOT]
+    btc = np.clip(_body_tc_from_x(x, 0.30), 0.10, 0.30)
 
     body_root_chord = rc * bcr
     # Elliptical cross-section: width=2*bw, height=btc*body_chord
@@ -110,7 +122,7 @@ def _fast_cg(x: np.ndarray, mission: MissionCondition,
     rc = x[:, _IDX_WING_ROOT_CHORD]
     bcr = x[:, _IDX_BODY_CHORD_RATIO]
     bw = x[:, _IDX_BODY_HALFWIDTH]
-    btc = x[:, _IDX_BODY_TC_ROOT]
+    btc = np.clip(_body_tc_from_x(x, 0.30), 0.10, 0.30)
     hs = x[:, _IDX_HALF_SPAN]
     tr = x[:, _IDX_TAPER]
     sweep = np.radians(x[:, _IDX_SWEEP])
@@ -150,12 +162,15 @@ def _fast_cg(x: np.ndarray, mission: MissionCondition,
     m_edf = mission.edf.mass
     m_avionics = mission.avionics_mass
     m_servo = cg_config.servo_mass
+    m_gear = cg_config.gear_mass
+    x_gear = body_root_chord * cg_config.gear_xc
 
     total_mass = (body_struct + wing_struct + m_batt + m_edf +
-                  m_avionics + m_servo)
+                  m_avionics + m_servo + m_gear)
     x_cg = (body_struct * x_body_cg + wing_struct * x_wing_cg +
              m_batt * x_batt + m_edf * x_edf +
-             m_avionics * x_avionics + m_servo * x_servo) / np.maximum(total_mass, 1e-6)
+             m_avionics * x_avionics + m_servo * x_servo +
+             m_gear * x_gear) / np.maximum(total_mass, 1e-6)
 
     return x_cg
 
@@ -169,7 +184,7 @@ def _fast_manufacturability(x: np.ndarray) -> np.ndarray:
     rc = x[:, _IDX_WING_ROOT_CHORD]
     tr = x[:, _IDX_TAPER]
     bcr = x[:, _IDX_BODY_CHORD_RATIO]
-    btc = x[:, _IDX_BODY_TC_ROOT]
+    btc = np.clip(_body_tc_from_x(x, 0.30), 0.10, 0.30)
     bw = x[:, _IDX_BODY_HALFWIDTH]
     sweep_delta = x[:, _IDX_BODY_SWEEP_DELTA]
 
@@ -216,17 +231,6 @@ def _fast_manufacturability(x: np.ndarray) -> np.ndarray:
     return scores
 
 
-def _fast_duct_fits(x: np.ndarray, edf) -> np.ndarray:
-    """Vectorized duct fit check."""
-    btc = x[:, _IDX_BODY_TC_ROOT]
-    rc = x[:, _IDX_WING_ROOT_CHORD]
-    bcr = x[:, _IDX_BODY_CHORD_RATIO]
-    body_root_chord = rc * bcr
-
-    body_thickness = btc * body_root_chord
-    required = edf.duct_outer_diameter / 0.80  # safety margin
-    return body_thickness >= required
-
 
 # ── Main reconstruction ─────────────────────────────────────────────────────
 
@@ -236,6 +240,8 @@ def reconstruct_aero(
     mission: MissionCondition | None = None,
     feasibility: FeasibilityConfig | None = None,
     cg_config: CGConfig | None = None,
+    aero_model=None,
+    servo_config=None,
 ) -> dict:
     """Reconstruct all derived aerodynamic and propulsion quantities from
     surrogate primitives.
@@ -260,7 +266,7 @@ def reconstruct_aero(
     sweep = x[:, _IDX_SWEEP]
     bcr = x[:, _IDX_BODY_CHORD_RATIO]
     bw = x[:, _IDX_BODY_HALFWIDTH]
-    btc = x[:, _IDX_BODY_TC_ROOT]
+    btc = np.clip(_body_tc_from_x(x, 0.30), 0.10, 0.30)
 
     tip_chord = rc * tr
     body_root_chord = rc * bcr
@@ -281,7 +287,8 @@ def reconstruct_aero(
         manuf_score = np.atleast_1d(np.asarray(primitives["manufacturability_score"], dtype=float))
         x_cg_frac = np.atleast_1d(np.asarray(primitives["x_cg_frac"], dtype=float))
         x_cg_real = x_cg_frac * body_root_chord
-        vs = np.atleast_1d(np.asarray(primitives["Vs"], dtype=float))
+        # Vs: always compute analytically (exact formula, no MLP approximation error)
+        vs = None  # will be computed below from s_ref
     else:
         # Legacy fallback for models without geometry targets
         struct_mass = _fast_structural_mass(x, mission.mtow)
@@ -289,12 +296,6 @@ def reconstruct_aero(
         x_cg_real = _fast_cg(x, mission, cg_config)
         manuf_score = _fast_manufacturability(x)
         vs = None  # computed below
-    # Duct clearance: use predicted if available, else fast check
-    if "min_duct_clearance_mm" in primitives:
-        min_clr = np.atleast_1d(np.asarray(primitives["min_duct_clearance_mm"], dtype=float))
-        duct_fits_arr = min_clr >= 0.0
-    else:
-        duct_fits_arr = _fast_duct_fits(x, mission.edf)
 
     # CL_required for level flight
     q = mission.dynamic_pressure
@@ -311,6 +312,10 @@ def reconstruct_aero(
     cn_beta = np.atleast_1d(np.asarray(primitives["Cn_beta"], dtype=float))
 
     # --- Aerodynamic reconstruction ---
+    cm_de = np.atleast_1d(np.asarray(primitives.get("Cm_de", 0.0), dtype=float))
+    cl_de_pred = np.atleast_1d(np.asarray(primitives.get("CL_de", 0.015), dtype=float))
+    cl_beta_pred = np.atleast_1d(np.asarray(primitives.get("Cl_beta", 0.0), dtype=float))
+
     alpha_eq_rad = np.where(
         np.abs(cl_alpha) > 0.1,
         (cl_required - cl_0) / cl_alpha,
@@ -319,43 +324,89 @@ def reconstruct_aero(
     alpha_eq = np.clip(np.degrees(alpha_eq_rad), -2.0, 12.0)
     alpha_eq_rad = np.radians(alpha_eq)
 
+    # Elevon deflection: use direct surrogate prediction (AVL coupled trim)
+    # if available, otherwise fall back to linear approximation
+    elevon_pred = primitives.get("elevon_deflection", None)
+    if elevon_pred is not None:
+        elevon_defl = np.clip(
+            np.atleast_1d(np.asarray(elevon_pred, dtype=float)), -25.0, 25.0
+        )
+    else:
+        cm_untrimmed = cm_0 + cm_alpha * alpha_eq_rad
+        cm_de_per_deg = np.where(np.abs(cm_de) > 1e-6, cm_de / np.degrees(1.0), -0.01)
+        elevon_defl = np.clip(
+            np.where(np.abs(cm_untrimmed) > 0.001, -cm_untrimmed / cm_de_per_deg, 0.0),
+            -25.0, 25.0,
+        )
+
     # Use trimmed CL from surrogate if available, else linear fallback
     cl_pred = primitives.get("CL", None)
     if cl_pred is not None:
         cl = np.atleast_1d(np.asarray(cl_pred, dtype=float))
     else:
         cl = cl_0 + cl_alpha * alpha_eq_rad
-    cm = cm_0 + cm_alpha * alpha_eq_rad
-    sm_raw = np.where(np.abs(cl_alpha) > 0.01, -cm_alpha / cl_alpha, 0.0)
+    cm = cm_0 + cm_alpha * alpha_eq_rad + cm_de * np.radians(elevon_defl)
+    # Static margin: use direct surrogate prediction if available,
+    # otherwise fall back to analytical CG correction
+    sm_pred = primitives.get("static_margin", None)
+    if sm_pred is not None:
+        sm = np.atleast_1d(np.asarray(sm_pred, dtype=float))
+    else:
+        sm_raw = np.where(np.abs(cl_alpha) > 0.01, -cm_alpha / cl_alpha, 0.0)
+        x_cg_old = body_root_chord * 0.30
+        c_ref = s_ref / (2.0 * hs)
+        safe_cref = np.where(c_ref > 0.01, c_ref, 1.0)
+        sm = sm_raw + (x_cg_old - x_cg_real) / safe_cref
+        cm = cm + cl * (x_cg_real - x_cg_old) / safe_cref
 
-    # ── CG correction ──
-    x_cg_old = body_root_chord * 0.30  # training reference
-    c_ref = s_ref / (2.0 * hs)
-    sm = sm_raw.copy()
-    safe_cref = np.where(c_ref > 0.01, c_ref, 1.0)
-    sm = sm_raw + (x_cg_old - x_cg_real) / safe_cref
-    cm = cm + cl * (x_cg_real - x_cg_old) / safe_cref
-
-    # Elevon trim deflection
-    cm_de = np.atleast_1d(np.asarray(primitives.get("Cm_de", 0.0), dtype=float))
-    cl_beta_pred = np.atleast_1d(np.asarray(primitives.get("Cl_beta", 0.0), dtype=float))
-    cm_de_per_deg = np.where(np.abs(cm_de) > 1e-6, cm_de / np.degrees(1.0), -0.01)
-    elevon_defl = np.where(
-        np.abs(cm) > 0.001,
-        -cm / cm_de_per_deg,
-        0.0,
-    )
-    elevon_defl = np.clip(elevon_defl, -25.0, 25.0)
+    # ── Servo hinge moment (vectorized) ──
+    from ..config import ServoConfig
+    _sc = servo_config or ServoConfig()
+    cf_ratio_elevon = 0.25  # from controls config default
+    c_flap = cf_ratio_elevon * mac
+    b_flap = 0.50 * outer_span  # elevon eta_outer default
+    delta_rad_servo = np.radians(np.abs(elevon_defl))
+    m_hinge = (0.5 * mission.density * mission.velocity**2
+               * c_flap**2 * b_flap * abs(_sc.ch_delta) * delta_rad_servo)
+    servo_torque = m_hinge / _sc.n_servos_elevon * 100 / 9.81
 
     # Stall speed (use predicted if available, else compute)
     if vs is None:
         vs = np.sqrt(2 * weight / (mission.density * s_ref * feasibility.cl_max_clean))
 
-    # Total CD0 = wing + body + intake
-    # intake_drag is cheap — just a ratio
+    # Total CD0 = wing + body + intake + gear + bump
+    from ..config import AeroModelConfig
+    _ac = aero_model or AeroModelConfig()
     s_intake = np.pi / 4 * mission.edf.intake_diameter ** 2
     cd_intake = 0.05 * s_intake / np.maximum(s_ref, 1e-6)
-    cd0 = cd0_wing + cd0_body + cd_intake
+    cd_gear = _ac.cd_gear
+
+    # Bump fairing drag: where duct protrudes above body OML
+    # bump_height ≈ max(0, duct_od - body_height_at_fan)
+    from ..parameterization.bwb_aircraft import vectorized_body_tc_at_xc
+    btc_fan = vectorized_body_tc_at_xc(
+        x[:, _IDX_BODY_KU_U2], x[:, _IDX_BODY_KU_U6], x[:, _IDX_BODY_KU_U7],
+        x[:, _IDX_BODY_KU_L2], x[:, _IDX_BODY_KU_L6], x[:, _IDX_BODY_KU_L7],
+        x_frac=0.40,
+    )
+    body_h_fan = btc_fan * body_root_chord
+    duct_od = mission.edf.duct_outer_diameter
+    bump_h = np.maximum(0.0, duct_od - body_h_fan)  # [m]
+    # Bump geometry: length ≈ 40% of body chord, width ≈ duct_od
+    bump_l = 0.40 * body_root_chord  # chordwise extent
+    bump_w = np.full_like(bump_h, duct_od)
+    # Hoerner form factor for streamlined protuberance
+    hl = bump_h / np.maximum(bump_l, 1e-6)
+    re_bump = mission.velocity * bump_l / max(mission.kinematic_viscosity, 1e-9)
+    cf_bump = np.where(re_bump > 5e5,
+                       0.455 / np.log10(np.maximum(re_bump, 10)) ** 2.58,
+                       1.328 / np.sqrt(np.maximum(re_bump, 1e3)))
+    ff_bump = 1.0 + 1.5 * hl ** 1.5 + 7.0 * hl ** 3.0
+    s_wet_bump = np.pi * bump_h * bump_l / 2.0 + 2.0 * bump_h * bump_w
+    cd0_bump = cf_bump * ff_bump * s_wet_bump / np.maximum(s_ref, 1e-6)
+    cd0_bump = np.where(bump_h > 0, cd0_bump, 0.0)
+
+    cd0 = cd0_wing + cd0_body + cd_intake + cd_gear + cd0_bump
 
     # CD and L/D: use direct surrogate predictions if available,
     # otherwise fall back to analytical reconstruction
@@ -375,33 +426,31 @@ def reconstruct_aero(
     else:
         cd = cd0 + cdi + cd_trim
 
-    if "L_over_D" in primitives:
-        ld = np.atleast_1d(np.asarray(primitives["L_over_D"], dtype=float))
-    else:
-        ld = np.where(cd > 1e-4, cl / cd, 0.0)
+    # L/D for level flight: use CL_required / CD (always positive for flyable designs)
+    # The surrogate L_over_D target is the AVL trim value which can be negative
+    # for untrimmed designs — not useful as an optimization objective.
+    ld = np.where(cd > 1e-4, cl_required / cd, 0.0)
 
     cd_effective = cd * feasibility.drag_margin
 
-    # --- Propulsion reconstruction ---
+    # --- Propulsion reconstruction (delegated to balance.py) ---
     drag_force = cd_effective * q * s_ref
-    t_avail = thrust_at_speed(mission.edf, mission.velocity)
-    t_available = np.full(n, t_avail)
-    t_over_d = np.where(drag_force > 0.01, t_available / drag_force, float("inf"))
-
+    from ..propulsion.balance import compute_propulsion_balance
+    _prop = compute_propulsion_balance(drag_force, mission.velocity,
+                                        mission.edf, mission.battery)
+    t_available = _prop["T_available"]
+    t_over_d = _prop["T_over_D"]
+    p_elec = _prop["P_elec"]
+    endurance_s = _prop["endurance_s"]
+    endurance_min = _prop["endurance_min"]
     p_thrust = drag_force * mission.velocity
-    eta_total = mission.edf.eta_fan * mission.edf.eta_motor
-    p_elec = np.where(eta_total > 0, p_thrust / eta_total, float("inf"))
-
-    usable_frac = 0.80
-    e_battery = mission.battery.energy_j
-    endurance_s = np.where(p_elec > 0, e_battery * usable_frac / p_elec, float("inf"))
-    endurance_min = endurance_s / 60.0
+    range_km = _prop["range_km"]
 
     # --- Penalty & feasibility (vectorized where possible) ---
     penalty = np.zeros(n)
     is_feasible = np.zeros(n, dtype=bool)
     for i in range(n):
-        p_val, _ = feasibility.compute_penalty(
+        p_val, c_dict = feasibility.compute_penalty(
             static_margin=sm[i],
             cm=cm[i],
             struct_mass=struct_mass[i],
@@ -412,12 +461,12 @@ def reconstruct_aero(
             cn_beta=cn_beta[i],
             t_over_d=t_over_d[i],
             endurance_s=endurance_s[i],
-            duct_fits=bool(duct_fits_arr[i]),
             vs=float(vs[i]),
             alpha_trim=float(alpha_eq[i]),
             elevon_deflection=float(elevon_defl[i]),
             cl_beta=float(cl_beta_pred[i]) if len(cl_beta_pred) > 1 else float(cl_beta_pred[0]),
             manufacturability_score=float(manuf_score[i]),
+            servo_torque_kgcm=float(servo_torque[i]),
         )
         penalty[i] = p_val
         is_feasible[i] = feasibility.is_feasible(
@@ -431,18 +480,19 @@ def reconstruct_aero(
             cn_beta=cn_beta[i],
             t_over_d=t_over_d[i],
             endurance_s=endurance_s[i],
-            duct_fits=bool(duct_fits_arr[i]),
             vs=float(vs[i]),
             alpha_trim=float(alpha_eq[i]),
             elevon_deflection=float(elevon_defl[i]),
             cl_beta=float(cl_beta_pred[i]) if len(cl_beta_pred) > 1 else float(cl_beta_pred[0]),
             manufacturability_score=float(manuf_score[i]),
+            servo_torque_kgcm=float(servo_torque[i]),
         )
 
     result = {
         "L_over_D": ld, "CL": cl, "CM": cm, "static_margin": sm,
         "alpha_eq": alpha_eq, "CDi": cdi, "CD": cd, "CD0": cd0,
         "CD0_wing": cd0_wing, "CD0_body": cd0_body, "CD_intake": cd_intake,
+        "CD_gear": cd_gear, "CD0_bump": cd0_bump,
         "CD_trim": cd_trim, "CD_effective": cd_effective, "Cn_beta": cn_beta,
         "oswald_e": e_oswald, "AR": ar, "S_ref": s_ref, "MAC": mac,
         "struct_mass": struct_mass, "internal_volume": internal_volume,
@@ -450,19 +500,22 @@ def reconstruct_aero(
         "manufacturability_score": manuf_score,
         "Cl_beta": cl_beta_pred, "Cm_de": cm_de,
         "elevon_deflection": elevon_defl,
+        "servo_torque_kgcm": servo_torque,
         "T_available": t_available, "T_over_D": t_over_d,
         "drag_force": drag_force, "P_thrust": p_thrust, "P_elec": p_elec,
         "endurance_s": endurance_s, "endurance_min": endurance_min,
-        "duct_fits": duct_fits_arr,
         "penalty": penalty, "is_feasible": is_feasible,
+        "constraints": c_dict,  # last iteration's constraints (used in single mode)
     }
 
     if single:
+        constraints_save = result["constraints"]
         result = {
             k: (float(v[0]) if hasattr(v, '__len__') and len(v) > 0 else float(v))
             for k, v in result.items()
+            if k != "constraints"
         }
-        result["duct_fits"] = bool(result["duct_fits"])
         result["is_feasible"] = bool(result["is_feasible"])
+        result["constraints"] = constraints_save
 
     return result

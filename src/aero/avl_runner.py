@@ -76,7 +76,7 @@ class ControlSurface:
 class ControlConfig:
     """Configuration for aircraft control surfaces.
 
-    Default: nEUROn-style elevon + aileron layout for BWB.
+    Default: MANTA-style elevon + aileron layout for BWB.
     """
     surfaces: list[ControlSurface] = field(default_factory=list)
     trim_elevon: bool = True   # use AVL trim for pitch with first surface

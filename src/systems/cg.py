@@ -43,6 +43,10 @@ class CGConfig:
     servo_mass: float = 0.040      # total for all servos (~10g each × 4)
     servo_xc: float = 0.70         # near trailing edge (at hinge line)
 
+    # Landing gear (ventral skid)
+    gear_mass: float = 0.050       # [kg] composite ventral skid
+    gear_xc: float = 0.55          # x/c position (under CG for ground stability)
+
 
 DEFAULT_CG_CONFIG = CGConfig()
 
@@ -183,6 +187,13 @@ def compute_cg(
                 x_cg=body_chord * config.servo_xc,
             ))
 
+    # ── Landing gear (ventral skid) ──
+    if config.gear_mass > 0:
+        components.append(ComponentPlacement(
+            "landing_gear", config.gear_mass,
+            x_cg=body_chord * config.gear_xc,
+        ))
+
     # ── Weighted CG computation ──
     total_mass = sum(c.mass for c in components)
     if total_mass <= 0:
@@ -259,8 +270,9 @@ def compute_mass_budget(
         "systems": {
             "avionics": {"mass_kg": avionics_mass, "margin": 0.10},
             "servos": {"mass_kg": config.servo_mass, "margin": 0.05},
+            "landing_gear": {"mass_kg": config.gear_mass, "margin": 0.05},
             "wiring_connectors": {"mass_kg": 0.020, "margin": 0.15},
-            "subtotal": avionics_mass + config.servo_mass + 0.020,
+            "subtotal": avionics_mass + config.servo_mass + config.gear_mass + 0.020,
         },
     }
 

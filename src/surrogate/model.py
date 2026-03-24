@@ -1,8 +1,8 @@
-"""Surrogate model predicting 7 VLM primitives for fast optimization.
+"""Surrogate model predicting VLM primitives for fast optimization.
 
-Predicts CL_0, CL_alpha, CM_0, CM_alpha, CD0_wing, CD0_body, Cn_beta --
-smooth functions of geometry.  Everything else (L/D, SM, CM, CDi, penalty,
-propulsion) is reconstructed analytically via reconstruct.py.
+Predicts all targets in PRIMITIVE_TARGETS (aero derivatives, geometry,
+constraints, trim quantities). Derived quantities (L/D, SM, penalty,
+propulsion) are reconstructed analytically via reconstruct.py.
 """
 
 import numpy as np
@@ -28,14 +28,12 @@ PRIMITIVE_TARGETS = [
     # v4: geometry/constraint targets (replaces _fast_* approximations)
     "struct_mass", "internal_volume", "manufacturability_score",
     "x_cg_frac", "Vs",
-    # v5: duct clearance (adaptive placement)
-    "min_duct_clearance_mm",
     # v6: direct CD and L/D (eliminates quadratic error propagation via CDi)
     "CD", "L_over_D",
+    # v7: AVL coupled quantities (not reproducible analytically)
+    "elevon_deflection",
+    "static_margin",
 ]
-
-# Backward-compatible: the original 7 targets for loading legacy models
-_LEGACY_TARGETS = PRIMITIVE_TARGETS[:7]
 
 # Physical bounds for filtering divergent VLM outputs before training.
 _TARGET_CLIP = {
@@ -58,10 +56,12 @@ _TARGET_CLIP = {
     "manufacturability_score":  (0.0, 1.0),
     "x_cg_frac":                (0.2, 1.0),
     "Vs":                       (5.0, 25.0),
-    "min_duct_clearance_mm":    (-20.0, 50.0),
     # v6: direct aero outputs
     "CD":                       (0.005, 0.200),
     "L_over_D":                 (-30.0, 30.0),
+    # v7: AVL coupled quantities
+    "elevon_deflection":        (-50.0, 50.0),  # widened: AVL trim can produce large deflections
+    "static_margin":            (-1.0, 2.0),
 }
 
 
@@ -109,7 +109,6 @@ class SurrogateModel:
     """
 
     n_ensemble: int = 5
-    _n_targets: int = 10            # 7 for legacy, 10 for v2 (with control derivatives)
     _models: list = field(default_factory=list, repr=False)
     _scaler_X: StandardScaler = field(default_factory=StandardScaler, repr=False)
     _scaler_Y: StandardScaler = field(default_factory=StandardScaler, repr=False)
@@ -132,68 +131,33 @@ class SurrogateModel:
         if len(results) < min_samples:
             return False
 
-        # --- Extract primitives from evaluation results ---
+        # --- Extract all PRIMITIVE_TARGETS from evaluation results ---
+        # CL_0 and CM_0 need special fallback logic; everything else is
+        # read directly from the result dict.
+        _FALLBACK = {
+            "CL_0": lambda r: r.get("CL_required", 0.0) - r.get("CL_alpha", 0.0) * np.radians(r.get("alpha_eq", 0.0)),
+            "CM_0": lambda r: r.get("CM", 0.0) - r.get("CM_alpha", 0.0) * np.radians(r.get("alpha_eq", 0.0)),
+            "CD0_wing": lambda r: r.get("CD0", 0.008) * 0.6,
+            "CD0_body": lambda r: r.get("CD0", 0.008) * 0.4,
+        }
+
         Y_rows = []
         valid_indices = []
         for i, r in enumerate(results):
             if not r.get("success", True):
                 continue
-            alpha_eq_rad = np.radians(r.get("alpha_eq", 0.0))
-            cl_alpha = r.get("CL_alpha", 0.0)
-            cm_alpha = r.get("CM_alpha", 0.0)
-
-            cl_0 = r.get("CL_0", None)
-            if cl_0 is None:
-                cl_0 = r.get("CL_required", 0.0) - cl_alpha * alpha_eq_rad
-            cm_0 = r.get("CM_0", None)
-            if cm_0 is None:
-                cm_0 = r.get("CM", 0.0) - cm_alpha * alpha_eq_rad
-
-            cd0_wing = r.get("CD0_wing", r.get("CD0", 0.008) * 0.6)
-            cd0_body = r.get("CD0_body", r.get("CD0", 0.008) * 0.4)
-            cn_beta = r.get("Cn_beta", 0.0)
-
-            # v2 control derivatives (from regeneration script)
-            # Uses "Cl_beta" regenerated with consistent s_ref/b_ref normalization.
-            cl_beta = r.get("Cl_beta", None)
-            cl_de = r.get("CL_de", None)
-            cm_de = r.get("Cm_de", None)
-
-            # v3: trimmed CL
-            cl_trimmed = r.get("CL", None)
-
-            # Skip samples without control derivatives if we need 10+ targets
-            if self._n_targets >= 10 and (cl_de is None or cm_de is None):
+            row = []
+            skip = False
+            for key in PRIMITIVE_TARGETS:
+                val = r.get(key, None)
+                if val is None and key in _FALLBACK:
+                    val = _FALLBACK[key](r)
+                if val is None:
+                    skip = True
+                    break
+                row.append(val)
+            if skip:
                 continue
-            if self._n_targets >= 11 and cl_trimmed is None:
-                continue
-
-            row = [cl_0, cl_alpha, cm_0, cm_alpha, cd0_wing, cd0_body, cn_beta]
-            if self._n_targets >= 10:
-                row.extend([cl_beta or 0.0, cl_de, cm_de])
-            if self._n_targets >= 11:
-                row.append(cl_trimmed)
-            if self._n_targets >= 16:
-                struct_m = r.get("struct_mass", None)
-                int_vol = r.get("internal_volume", None)
-                manuf_s = r.get("manufacturability_score", None)
-                xcg_f = r.get("x_cg_frac", None)
-                vs_val = r.get("Vs", None)
-                if any(v is None for v in [struct_m, int_vol, manuf_s, xcg_f, vs_val]):
-                    continue
-                row.extend([struct_m, int_vol, manuf_s, xcg_f, vs_val])
-            if self._n_targets >= 17:
-                clr_val = r.get("min_duct_clearance_mm", None)
-                if clr_val is None:
-                    continue
-                row.append(clr_val)
-            if self._n_targets >= 19:
-                cd_val = r.get("CD", None)
-                ld_val = r.get("L_over_D", None)
-                if cd_val is None or ld_val is None:
-                    continue
-                row.extend([cd_val, ld_val])
-
             Y_rows.append(row)
             valid_indices.append(i)
 
@@ -206,7 +170,7 @@ class SurrogateModel:
 
         # --- Filter divergent samples using physical bounds ---
         mask = np.ones(len(Y), dtype=bool)
-        for j, key in enumerate(PRIMITIVE_TARGETS[:self._n_targets]):
+        for j, key in enumerate(PRIMITIVE_TARGETS):
             lo, hi = _TARGET_CLIP[key]
             col_mask = (Y[:, j] >= lo) & (Y[:, j] <= hi)
             n_rejected = (~col_mask).sum()
@@ -236,7 +200,7 @@ class SurrogateModel:
             from scipy.stats import skew as _skew
             _log(f"\n  {'Target':<12} {'Mean':>10} {'Std':>10} {'Skew':>8} {'Min':>10} {'Max':>10}")
             _log(f"  {'-'*62}")
-            for j, key in enumerate(PRIMITIVE_TARGETS[:self._n_targets]):
+            for j, key in enumerate(PRIMITIVE_TARGETS):
                 col = Y_clean[:, j]
                 _log(f"  {key:<12} {col.mean():>10.5f} {col.std():>10.5f} {_skew(col):>8.2f} {col.min():>10.5f} {col.max():>10.5f}")
             _log("")
@@ -334,7 +298,7 @@ class SurrogateModel:
         return True
 
     def _predict_ensemble(self, X: np.ndarray) -> np.ndarray:
-        """Run ensemble inference -> (n_ensemble, n_samples, 7)."""
+        """Run ensemble inference -> (n_ensemble, n_samples, n_targets)."""
         X_aug = augment_features(X)
         X_scaled = self._scaler_X.transform(X_aug)
         X_t = torch.tensor(X_scaled, dtype=torch.float32, device=self._device)
@@ -350,11 +314,11 @@ class SurrogateModel:
 
     @property
     def target_keys(self) -> list[str]:
-        """Target keys this model predicts (7 for legacy, 10 for v2)."""
-        return PRIMITIVE_TARGETS[:self._n_targets]
+        """Target keys this model predicts."""
+        return list(PRIMITIVE_TARGETS)
 
     def predict(self, X: np.ndarray) -> dict:
-        """Predict VLM primitives (ensemble mean). Returns 7 or 10 targets."""
+        """Predict VLM primitives (ensemble mean)."""
         if not self._is_trained:
             raise RuntimeError("Surrogate not trained yet.")
 
@@ -420,7 +384,7 @@ class SurrogateModel:
             "layers": list(self._layers_used),
             "target_keys": list(self.target_keys),
             "n_features_aug": self._scaler_X.n_features_in_,
-            "n_targets": self._n_targets,
+            "n_targets": len(PRIMITIVE_TARGETS),
         }
         (path / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -438,7 +402,6 @@ class SurrogateModel:
         n_targets = len(meta["target_keys"])
 
         sm = cls(n_ensemble=meta["n_ensemble"])
-        sm._n_targets = meta.get("n_targets", len(meta["target_keys"]))
         sm._device = device
         sm._layers_used = layers
         sm._scaler_X = joblib.load(path / "scaler_X.pkl")

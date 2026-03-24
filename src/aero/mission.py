@@ -1,23 +1,25 @@
 """Mission condition and feasibility constraints.
 
-Extends v1's MissionCondition with propulsion integration:
-- EDF spec and battery spec as mission parameters
-- Feasibility constraints include thrust margin, endurance, and duct fit.
+MissionCondition is a data container for flight state and hardware specs.
+Propulsion computations (thrust, endurance, duct mass) live in
+src.propulsion.balance — not here.
 """
 
 import numpy as np
 import aerosandbox as asb
 from dataclasses import dataclass, field
 from ..propulsion.edf_model import (
-    EDFSpec, BatterySpec, EDF_70MM, BATTERY_3S_1300, BATTERY_3S_1800,
-    thrust_at_speed, endurance as compute_endurance,
-    duct_fits_in_body, intake_drag,
+    EDFSpec, BatterySpec, EDF_70MM, BATTERY_3S_1800,
 )
 
 
 @dataclass
 class MissionCondition:
-    """Flight condition with propulsion specification."""
+    """Flight condition with propulsion hardware specification.
+
+    This is a data container. Propulsion computations (thrust, endurance,
+    duct mass) are in src.propulsion.balance.
+    """
 
     # Flight state
     velocity: float = 20.0          # [m/s] cruise speed
@@ -25,7 +27,7 @@ class MissionCondition:
     mtow: float = 1.5              # [kg] max takeoff weight
 
     # Fixed component masses (see systems/avionics.py for detailed BOM)
-    avionics_mass: float = 0.179    # [kg] detailed BOM (FC, Rx, GPS, ESC, servos, FPV, etc.)
+    avionics_mass: float = 0.179    # [kg] detailed BOM
     auxiliary_mass: float = 0.080   # [kg] linkages, camera window, FC mount, battery box
     payload_mass: float = 0.200     # [kg] mission payload (camera, gimbal, sensors)
 
@@ -33,33 +35,24 @@ class MissionCondition:
     edf: EDFSpec = field(default_factory=lambda: EDF_70MM)
     battery: BatterySpec = field(default_factory=lambda: BATTERY_3S_1800)
 
+    # Duct structure mass — set externally or use default estimate
+    _duct_mass: float = 0.019       # [kg] default for 70mm EDF
+
     @property
     def motor_mass(self) -> float:
-        """EDF unit mass [kg]."""
         return self.edf.mass
 
     @property
     def battery_mass(self) -> float:
-        """Battery mass [kg]."""
         return self.battery.mass
 
     @property
     def duct_mass(self) -> float:
-        """Duct structure mass [kg] (wall + mounting hardware)."""
-        try:
-            from ..propulsion.duct_geometry import (
-                compute_duct_placement, compute_duct_structure_mass,
-            )
-            from ..parameterization.design_variables import BWBParams
-            # Use default params for duct mass estimate (placement varies
-            # little across the design space since duct dimensions come
-            # from EDF spec, not wing geometry).
-            from ..config import duct_from_config, load_config
-            _duct_cfg = duct_from_config(load_config())
-            placement = compute_duct_placement(BWBParams(), self.edf, config=_duct_cfg)
-            return compute_duct_structure_mass(placement, config=_duct_cfg)
-        except Exception:
-            return 0.19  # fallback estimate for 70mm EDF
+        return self._duct_mass
+
+    @duct_mass.setter
+    def duct_mass(self, value: float):
+        self._duct_mass = value
 
     @property
     def mass_budget(self) -> float:
@@ -89,19 +82,6 @@ class MissionCondition:
     def kinematic_viscosity(self) -> float:
         atm = self.atmosphere
         return float(atm.dynamic_viscosity() / atm.density())
-
-    @property
-    def thrust_available(self) -> float:
-        """Thrust available at cruise speed [N]."""
-        return thrust_at_speed(self.edf, self.velocity)
-
-    def propulsion_balance(self, drag: float) -> dict:
-        """Full propulsion balance from total drag [N]."""
-        return compute_endurance(drag, self.velocity, self.edf, self.battery)
-
-    def intake_cd(self, s_ref: float) -> float:
-        """Intake drag coefficient for the current EDF."""
-        return intake_drag(self.edf, s_ref)
 
     def stall_speed(self, s_ref: float, cl_max: float) -> float:
         """Stall speed [m/s] for given S_ref and CL_max."""
@@ -141,6 +121,9 @@ class FeasibilityConfig:
     elevon_deflection_max: float = 15.0  # [deg] max trim elevon deflection
     cl_beta_cn_beta_max: float = -30.0   # max |Cl_beta/Cn_beta| ratio (dutch roll)
 
+    # ── Servo torque constraint ──
+    servo_torque_max_kgcm: float = 1.3  # max servo torque (Emax ES3004)
+
     # ── Manufacturability constraint ──
     manufacturability_min: float = 0.40  # min composite score [0-1]
 
@@ -157,13 +140,13 @@ class FeasibilityConfig:
     # ── Propulsion penalty weights ──
     w_td: float = 20.0            # T/D margin (critical: can't fly)
     w_endurance: float = 15.0     # endurance
-    w_duct_fit: float = 25.0      # duct must physically fit
 
     # ── Stall / control penalty weights ──
     w_vs: float = 20.0            # stall speed (critical: can't land)
     w_alpha_trim: float = 10.0    # trim alpha out of range
     w_elevon_defl: float = 15.0   # elevon deflection too large for trim
     w_dutch_roll: float = 10.0    # Cl_beta/Cn_beta ratio (lateral coupling)
+    w_servo_torque: float = 15.0  # servo torque exceeds spec
     w_manufacturability: float = 10.0  # manufacturability score too low
 
     def compute_penalty(
@@ -178,12 +161,12 @@ class FeasibilityConfig:
         cn_beta: float | None = None,
         t_over_d: float | None = None,
         endurance_s: float | None = None,
-        duct_fits: bool | None = None,
         vs: float | None = None,
         alpha_trim: float | None = None,
         elevon_deflection: float | None = None,
         cl_beta: float | None = None,
         manufacturability_score: float | None = None,
+        servo_torque_kgcm: float | None = None,
     ) -> tuple[float, dict]:
         """Compute total penalty and constraint violations.
 
@@ -236,12 +219,6 @@ class FeasibilityConfig:
             penalty += self.w_endurance * max(0, g_endurance / max(self.endurance_min, 1.0))
             constraints["g_endurance"] = g_endurance
 
-        if duct_fits is not None and not duct_fits:
-            penalty += self.w_duct_fit
-            constraints["g_duct_fit"] = 1.0  # violated
-        elif duct_fits is not None:
-            constraints["g_duct_fit"] = -1.0  # satisfied
-
         # ── Stall / control constraints ──
         if vs is not None:
             g_vs = vs - self.vs_max
@@ -263,6 +240,12 @@ class FeasibilityConfig:
             g_elev = abs(elevon_deflection) - self.elevon_deflection_max
             penalty += self.w_elevon_defl * max(0, g_elev / max(self.elevon_deflection_max, 1.0))
             constraints["g_elevon_defl"] = g_elev
+
+        # ── Servo torque constraint ──
+        if servo_torque_kgcm is not None:
+            g_servo = servo_torque_kgcm - self.servo_torque_max_kgcm
+            penalty += self.w_servo_torque * max(0, g_servo / max(self.servo_torque_max_kgcm, 0.01))
+            constraints["g_servo_torque"] = g_servo
 
         # ── Dutch roll lateral coupling ──
         if cl_beta is not None and cn_beta is not None and cn_beta > 0.001:
@@ -292,13 +275,13 @@ class FeasibilityConfig:
         cn_beta: float | None = None,
         t_over_d: float | None = None,
         endurance_s: float | None = None,
-        duct_fits: bool | None = None,
         success: bool = True,
         vs: float | None = None,
         alpha_trim: float | None = None,
         elevon_deflection: float | None = None,
         cl_beta: float | None = None,
         manufacturability_score: float | None = None,
+        servo_torque_kgcm: float | None = None,
     ) -> bool:
         """Check if all constraints are satisfied."""
         checks = [
@@ -317,8 +300,6 @@ class FeasibilityConfig:
             checks.append(t_over_d >= self.td_min)
         if endurance_s is not None:
             checks.append(endurance_s >= self.endurance_min)
-        if duct_fits is not None:
-            checks.append(duct_fits)
         if vs is not None:
             checks.append(vs <= self.vs_max)
         if alpha_trim is not None:
@@ -327,6 +308,8 @@ class FeasibilityConfig:
             checks.append(abs(elevon_deflection) <= self.elevon_deflection_max)
         if cl_beta is not None and cn_beta is not None and cn_beta > 0.001:
             checks.append(cl_beta / cn_beta >= self.cl_beta_cn_beta_max)
+        if servo_torque_kgcm is not None:
+            checks.append(servo_torque_kgcm <= self.servo_torque_max_kgcm)
         if manufacturability_score is not None:
             checks.append(manufacturability_score >= self.manufacturability_min)
         return all(checks)

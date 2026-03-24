@@ -19,9 +19,9 @@ from ..parameterization.bwb_aircraft import (
 from .mission import MissionCondition, FeasibilityConfig, DEFAULT_FEASIBILITY
 from .drag import compute_wing_cd0, compute_body_cd0, oswald_efficiency
 from .avl_runner import run_avl_stability, ControlConfig
-from ..propulsion.edf_model import (
-    thrust_at_speed, endurance as compute_endurance_full,
-    duct_fits_in_body, intake_drag,
+from ..propulsion.balance import (
+    compute_propulsion_balance, compute_intake_cd,
+    compute_bump_drag, compute_duct_clearance, compute_duct_mass,
 )
 from ..systems.cg import compute_cg, CGConfig, DEFAULT_CG_CONFIG
 from ..evaluation.manufacturability import compute_manufacturability
@@ -38,6 +38,7 @@ class AeroEvaluator:
                  use_cg: bool = True,
                  aero_model=None,
                  structure_config=None,
+                 servo_config=None,
                  **kwargs):
         self.mission = mission or MissionCondition()
         self.feasibility = feasibility or DEFAULT_FEASIBILITY
@@ -58,6 +59,7 @@ class AeroEvaluator:
         self.use_cg = use_cg
         self.aero_model = aero_model
         self.structure_config = structure_config
+        self.servo_config = servo_config
 
     def evaluate(self, params: BWBParams) -> dict:
         """Full aero + stability + propulsion + control evaluation.
@@ -97,6 +99,7 @@ class AeroEvaluator:
         cm_de = 0.0
         cl_da = 0.0
         cn_da = 0.0
+        servo_torque_kgcm = 0.0
 
         try:
             # AVL at alpha=0: get CL_0, CM_0 + all stability derivatives
@@ -153,6 +156,18 @@ class AeroEvaluator:
             # Get trim elevon deflection from AVL output
             elevon_deflection = avl_t.get("delta_elevon", 0.0)
 
+            # ── Servo hinge moment ──
+            from ..config import ServoConfig
+            _sc = self.servo_config or ServoConfig()
+            elevon_surf = self.controls.surfaces[0]  # elevon
+            cf_ratio = elevon_surf.cf_ratio
+            c_flap = cf_ratio * mac
+            b_flap = elevon_surf.eta_outer * (params.half_span - params.body_halfwidth)
+            delta_rad = np.radians(abs(elevon_deflection))
+            m_hinge = (0.5 * mission.density * mission.velocity**2
+                       * c_flap**2 * b_flap * abs(_sc.ch_delta) * delta_rad)
+            servo_torque_kgcm = m_hinge / _sc.n_servos_elevon * 100 / 9.81
+
             # Update control derivatives from trim run (more accurate)
             cl_de = avl_t.get("CLd01", cl_de)
             cm_de = avl_t.get("Cmd01", cm_de)
@@ -173,7 +188,7 @@ class AeroEvaluator:
             success = False
 
         # ── Drag buildup ──
-        cd_intake = intake_drag(mission.edf, s_ref)
+        cd_intake = compute_intake_cd(mission.edf, s_ref)
 
         if self.use_neuralfoil:
             cd0_wing = compute_wing_cd0(params, alpha_eq, mission.velocity,
@@ -188,21 +203,27 @@ class AeroEvaluator:
                                      mission.kinematic_viscosity, s_ref, cd_intake,
                                      config=self.aero_model)
 
-        cd0 = cd0_wing + cd0_body
+        cd_gear = _ac.cd_gear
+
+        # Bump fairing drag (duct protrusion above body OML)
+        cd0_bump, bump = compute_bump_drag(
+            params, mission.edf, mission.velocity,
+            mission.kinematic_viscosity, s_ref,
+        )
+
+        cd0 = cd0_wing + cd0_body + cd0_bump + cd_gear
         e = oswald_efficiency(ar, params.le_sweep_deg, params.taper_ratio)
         cd_induced = cl**2 / (np.pi * ar * e) if ar > 1.0 else 0.1
 
-        # Trim drag: additional induced drag from elevon deflection
-        # Approximate: delta_CD_trim ≈ (CL_de * delta_e)^2 / (pi * AR * e)
-        # plus profile drag increment ≈ 0.0001 * |delta_e_deg| / 10
+        # Trim drag
         cd_trim = 0.0
         if abs(elevon_deflection) > 0.1:
             delta_cl_trim = cl_de * np.radians(elevon_deflection)
             cd_trim = (delta_cl_trim ** 2 / (np.pi * ar * e) if ar > 1.0 else 0.0)
-            cd_trim += 0.0001 * abs(elevon_deflection) / 10.0  # profile drag increment
+            cd_trim += 0.0001 * abs(elevon_deflection) / 10.0
 
         cd = cd0 + cd_induced + cd_trim
-        l_over_d = cl / cd if cd > 1e-4 else 0.0
+        l_over_d = cl_required / cd if cd > 1e-4 else 0.0
         cd_effective = cd * self.feasibility.drag_margin
 
         # ── Structural + volume ──
@@ -215,26 +236,17 @@ class AeroEvaluator:
         fc = self.feasibility
         vs = mission.stall_speed(s_ref, fc.cl_max_clean)
 
-        # ── Propulsion balance (uses cd_effective for conservative margin) ──
+        # ── Propulsion balance ──
         drag_force = cd_effective * mission.dynamic_pressure * s_ref
-        t_available = thrust_at_speed(mission.edf, mission.velocity)
-        t_over_d = t_available / drag_force if drag_force > 0.01 else float("inf")
-
-        prop = compute_endurance_full(drag_force, mission.velocity,
-                                       mission.edf, mission.battery)
+        prop = compute_propulsion_balance(drag_force, mission.velocity,
+                                          mission.edf, mission.battery)
+        t_available = prop["T_available"]
+        t_over_d = prop["T_over_D"]
         endurance_s = prop["endurance_s"]
 
-        # Duct fit constraint (adaptive placement + station-by-station clearance)
-        body_chord = params.body_root_chord
-        from ..propulsion.duct_geometry import compute_duct_placement, validate_duct_clearance
-        from ..config import duct_from_config, load_config
-        _duct_cfg = duct_from_config(load_config())
-        placement = compute_duct_placement(params, mission.edf, config=_duct_cfg)
-        _duct_ok, _clr = validate_duct_clearance(placement, params, min_clearance_mm=0.0)
-        min_duct_clearance_mm = min(
-            min(r.clearance_top_mm, r.clearance_bot_mm) for r in _clr
-        ) if _clr else 0.0
-        duct_ok = min_duct_clearance_mm >= 0.0
+        # ── Duct clearance ──
+        duct_ok, min_duct_clearance_mm, _placement = compute_duct_clearance(
+            params, mission.edf)
 
         # Manufacturability score (geometry-only, no AVL needed)
         manuf = compute_manufacturability(params)
@@ -244,20 +256,23 @@ class AeroEvaluator:
         is_feasible = fc.is_feasible(
             static_margin, cm, struct_mass, mission.mass_budget,
             cl_required, ar, internal_volume, cn_beta,
-            t_over_d, endurance_s, duct_ok, success,
+            t_over_d, endurance_s,
+            success=success,
             vs=vs, alpha_trim=alpha_eq,
             elevon_deflection=elevon_deflection,
             cl_beta=cl_beta,
             manufacturability_score=manuf_score,
+            servo_torque_kgcm=servo_torque_kgcm,
         )
         penalty, constraints = fc.compute_penalty(
             static_margin, cm, struct_mass, mission.mass_budget,
             cl_required, ar, internal_volume, cn_beta,
-            t_over_d, endurance_s, duct_ok,
+            t_over_d, endurance_s,
             vs=vs, alpha_trim=alpha_eq,
             elevon_deflection=elevon_deflection,
             cl_beta=cl_beta,
             manufacturability_score=manuf_score,
+            servo_torque_kgcm=servo_torque_kgcm,
         )
 
         result = {
@@ -292,9 +307,10 @@ class AeroEvaluator:
             "Cm_de": cm_de,
             "Cl_da": cl_da,
             "Cn_da": cn_da,
+            "servo_torque_kgcm": servo_torque_kgcm,
             # CG
             "x_cg": x_cg if x_cg is not None else params.body_root_chord * 0.30,
-            "x_cg_frac": (x_cg / body_chord if x_cg else 0.30),
+            "x_cg_frac": (x_cg / params.body_root_chord if x_cg else 0.30),
             # Manufacturability
             "manufacturability_score": manuf_score,
             # Structure
@@ -312,6 +328,9 @@ class AeroEvaluator:
             "duct_fits": duct_ok,
             "min_duct_clearance_mm": min_duct_clearance_mm,
             "CD_intake": cd_intake,
+            "CD_gear": cd_gear,
+            "CD0_bump": cd0_bump,
+            "bump_max_height_mm": bump["max_height_mm"],
             # Feasibility
             "is_feasible": is_feasible,
             "penalty": penalty,

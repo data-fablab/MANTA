@@ -91,10 +91,13 @@ def compute_manufacturability(params: BWBParams, config=None) -> dict:
     metrics["sweep_delta"] = abs(p.body_sweep_delta)
 
     # ── 6. Surface complexity ─────────────────────────────────────────────
-    # LE droop creates compound curvature at the nose.
-    metrics["le_droop"] = p.body_le_droop
-    # Camber + reflex interaction
-    metrics["camber_reflex_range"] = abs(p.body_camber) + abs(p.body_reflex)
+    # Body Kulfan weight variance as proxy for surface complexity.
+    # Higher variance = more complex shape = harder to manufacture.
+    body_weights = np.array([
+        p.body_kulfan_u2, p.body_kulfan_u6, p.body_kulfan_u7,
+        p.body_kulfan_l2, p.body_kulfan_l6, p.body_kulfan_l7,
+    ])
+    metrics["body_kulfan_variance"] = float(np.var(body_weights))
 
     # ── 7. Internal volume (equipment accessibility) ──────────────────────
     try:

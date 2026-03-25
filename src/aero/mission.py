@@ -253,9 +253,9 @@ class FeasibilityConfig:
         # ── Dutch roll lateral coupling ──
         if cl_beta is not None and cn_beta is not None and cn_beta > 0.001:
             ratio = cl_beta / cn_beta
-            g_dutch = ratio - self.cl_beta_cn_beta_max  # ratio is negative, max is negative
-            # Penalize if ratio is too negative (strong adverse coupling)
-            penalty += self.w_dutch_roll * max(0, -g_dutch / max(abs(self.cl_beta_cn_beta_max), 1.0))
+            # g_dutch <= 0 means satisfied (ratio >= threshold, not too negative)
+            g_dutch = self.cl_beta_cn_beta_max - ratio
+            penalty += self.w_dutch_roll * max(0, g_dutch / max(abs(self.cl_beta_cn_beta_max), 1.0))
             constraints["g_dutch_roll"] = g_dutch
 
         # ── Manufacturability constraint ──

@@ -471,6 +471,7 @@ def run_nsga2_assisted(
         "g_sm_lo", "g_sm_hi", "g_td", "g_endurance", "g_vs",
         "g_elevon_defl", "g_cn_beta", "g_ar", "g_volume",
         "g_manufacturability", "g_servo_torque",
+        "g_bump", "g_dutch_roll",
     ]
     _n_constr = len(_constr_keys)
 

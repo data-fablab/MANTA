@@ -4,6 +4,7 @@ from .edf_model import thrust_at_speed, power_required, endurance, intake_drag
 from .duct_geometry import (
     DuctPlacement,
     ClearanceResult,
+    DuctSpine,
     size_and_place_duct,
     compute_duct_placement,  # backward-compatible alias
     compute_duct_centerline,
@@ -28,7 +29,7 @@ from .balance import (
 __all__ = [
     "EDFSpec", "EDF_70MM", "EDF_90MM",
     "thrust_at_speed", "power_required", "endurance", "intake_drag",
-    "DuctPlacement", "ClearanceResult",
+    "DuctPlacement", "ClearanceResult", "DuctSpine",
     "size_and_place_duct", "compute_duct_placement",
     "compute_duct_centerline", "duct_cross_section",
     "validate_duct_clearance", "min_effective_clearance_mm",

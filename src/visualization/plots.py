@@ -428,8 +428,8 @@ def plot_cad_multiview(params: BWBParams, placement=None,
         ax_side.plot(placement.fan_x*1000, placement.fan_z*1000, 'bs', ms=8)
         ax_side.plot(placement.exhaust_x*1000, placement.exhaust_z*1000, 'r^', ms=8)
 
-        # EDF outline
-        fan_r = placement.duct_od / 2 * 1000
+        # EDF outline (structural OD — consistent with clearance envelope)
+        fan_r = (placement.duct_od / 2 + placement.duct_wall_thickness) * 1000
         ax_side.add_patch(Circle((placement.fan_x*1000, placement.fan_z*1000),
                                   fan_r, fill=False, color='#3498db', lw=1.5))
 

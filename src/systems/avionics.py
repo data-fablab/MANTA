@@ -222,27 +222,26 @@ def compute_component_positions_3d(
     duct_xc_max = 0.0
     try:
         from ..propulsion.duct_geometry import (
-            compute_duct_placement, compute_duct_centerline, duct_cross_section,
+            compute_duct_placement, DuctSpine,
         )
         from ..propulsion.edf_model import EDF_70MM
 
         from ..config import duct_from_config, load_config
         _duct_cfg = duct_from_config(load_config())
         placement = compute_duct_placement(p, EDF_70MM, config=_duct_cfg)
-        centerline = compute_duct_centerline(placement, n_pts=60)
-        x_start = centerline[0, 0]
-        x_end = centerline[-1, 0]
-        duct_xc_min = x_start / bc
-        duct_xc_max = x_end / bc
+        spine = DuctSpine(placement)
+        t_arr = np.linspace(0, 1, 60)
+        centerline = spine.positions(t_arr)
+        duct_xc_min = centerline[0, 0] / bc
+        duct_xc_max = centerline[-1, 0] / bc
 
-        # Precompute duct envelope at fine x/c resolution
+        # Precompute duct envelope at fine resolution (arc-length uniform)
         _duct_xc = []
         _duct_top = []
         _duct_bot = []
-        for i in range(len(centerline)):
+        for i, t in enumerate(t_arr):
             cx, _, cz = centerline[i]
-            t = np.clip((cx - x_start) / max(x_end - x_start, 1e-9), 0, 1)
-            cs = duct_cross_section(t, placement, n_pts=32)
+            cs = spine.cross_section(t, n_pts=32)
             _duct_xc.append(cx / bc)
             _duct_top.append((cz + cs[:, 1].max()) * 1000)
             _duct_bot.append((cz + cs[:, 1].min()) * 1000)

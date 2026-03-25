@@ -262,6 +262,285 @@ compute_duct_placement = size_and_place_duct
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# DuctSpine — single source of truth for duct geometry
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DuctSpine:
+    """Parametric duct spine — centerline + cross-sections from arc-length t.
+
+    Encapsulates the complete duct geometry as a single object.  Every
+    consumer (3-D builders, 2-D plot, clearance, bump) queries this spine
+    instead of independently reconstructing coordinates.
+
+    Parameters
+    ----------
+    placement : DuctPlacement
+        Sized duct from ``size_and_place_duct``.
+
+    The spine is parameterised by *arc-length fraction* ``t ∈ [0, 1]``:
+
+    ========= =========== ============ =========== ===================
+    t = 0     t_ramp_end  t_housing_s  t_housing_e t = 1
+    INTAKE    S-DUCT      HOUSING      NOZZLE
+    (rect)    (rect→circ) (circle)     (circ→ell)
+    ========= =========== ============ =========== ===================
+    """
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+    def __init__(self, placement: DuctPlacement, body_twist_deg: float = 0.0,
+                 n_table: int = 500):
+        p = self._p = placement
+        self._body_twist_rad = np.radians(body_twist_deg)
+
+        # ── Build the three geometric curves ──────────────────────────
+        # seg0: intake ramp — quadratic z = intake_z - depth * frac²
+        ramp_end_x = p.intake_x + p.intake_length
+        ramp_end_z = p.intake_z - p.intake_depth
+
+        n0 = max(n_table // 5, 20)
+        frac0 = np.linspace(0, 1, n0)
+        seg0 = np.column_stack([
+            p.intake_x + frac0 * p.intake_length,
+            np.zeros(n0),
+            p.intake_z - p.intake_depth * frac0 ** 2,
+        ])
+
+        # seg1: S-duct cubic Bezier  (ramp bottom → fan face)
+        p0 = np.array([ramp_end_x, 0.0, ramp_end_z])
+        p3 = np.array([p.fan_x, 0.0, p.fan_z])
+        dx = p3[0] - p0[0]
+        ramp_slope = -2 * p.intake_depth / max(p.intake_length, 1e-6)
+        ramp_dir = np.array([1.0, 0.0, ramp_slope])
+        ramp_dir /= np.linalg.norm(ramp_dir)
+        self._bez1 = (p0, p0 + ramp_dir * dx * 0.4,
+                       p3 + np.array([-dx * 0.4, 0.0, 0.0]), p3)
+
+        n1 = max(n_table * 2 // 5, 40)
+        seg1 = _cubic_bezier(*self._bez1, n1)
+
+        # seg2: nozzle cubic Bezier  (fan face → exhaust)
+        q0 = p3.copy()
+        q3 = np.array([p.exhaust_x, 0.0, p.exhaust_z])
+        dx2 = q3[0] - q0[0]
+        self._bez2 = (q0, q0 + np.array([dx2 * 0.3, 0.0, 0.0]),
+                       q3 + np.array([-dx2 * 0.3, 0.0, 0.0]), q3)
+
+        n2 = n_table - n0 - n1
+        seg2 = _cubic_bezier(*self._bez2, max(n2, 20))
+
+        # Concatenate (removing duplicate junction points)
+        self._pts = np.vstack([seg0, seg1[1:], seg2[1:]])
+        n_total = len(self._pts)
+
+        # ── Arc-length table ──────────────────────────────────────────
+        diffs = np.diff(self._pts, axis=0)
+        ds = np.sqrt((diffs ** 2).sum(axis=1))
+        cum = np.concatenate([[0.0], np.cumsum(ds)])
+        total_len = cum[-1]
+        self._s_total = total_len
+        self._cum_s = cum                       # (n_total,)
+        self._t_table = cum / total_len         # normalised to [0, 1]
+
+        # ── Segment boundaries in t-space ─────────────────────────────
+        # seg0 has n0 points → last index of seg0 = n0 - 1
+        self._idx_ramp_end = n0 - 1
+        # seg1[1:] adds n1-1 points → last index = n0-1 + n1-1
+        self._idx_fan_face = n0 - 1 + n1 - 1
+
+        self._t_ramp_end = self._t_table[self._idx_ramp_end]
+        self._t_fan_face = self._t_table[self._idx_fan_face]
+
+        # Housing boundaries in x-space → map to t
+        housing_x_start = p.fan_x - p.housing_length / 2
+        housing_x_end = p.fan_x + p.housing_length / 2
+        # Clamp: housing can't start before ramp end or extend past exhaust
+        housing_x_start = max(housing_x_start, ramp_end_x)
+        housing_x_end = min(housing_x_end, p.exhaust_x)
+
+        self._t_housing_start = float(np.interp(
+            housing_x_start, self._pts[:, 0], self._t_table))
+        self._t_housing_end = float(np.interp(
+            housing_x_end, self._pts[:, 0], self._t_table))
+
+        # Clamp: S-duct must have non-zero length
+        if self._t_housing_start <= self._t_ramp_end + 1e-6:
+            self._t_housing_start = self._t_ramp_end + 1e-6
+        if self._t_housing_end <= self._t_housing_start + 1e-6:
+            self._t_housing_end = self._t_housing_start + 1e-6
+
+        # ── Radii ─────────────────────────────────────────────────────
+        self._r_structural = p.duct_od / 2 + p.duct_wall_thickness
+        self._r_flow = p.fan_diameter / 2
+
+    # ------------------------------------------------------------------
+    # Segment boundary properties
+    # ------------------------------------------------------------------
+    @property
+    def t_ramp_end(self) -> float:
+        """End of intake ramp / start of S-duct."""
+        return self._t_ramp_end
+
+    @property
+    def t_fan_face(self) -> float:
+        """Fan face — inside the housing, NOT a builder boundary."""
+        return self._t_fan_face
+
+    @property
+    def t_housing_start(self) -> float:
+        """Start of EDF cylindrical housing."""
+        return self._t_housing_start
+
+    @property
+    def t_housing_end(self) -> float:
+        """End of EDF housing / start of nozzle."""
+        return self._t_housing_end
+
+    @property
+    def placement(self) -> DuctPlacement:
+        return self._p
+
+    # ------------------------------------------------------------------
+    # Core queries
+    # ------------------------------------------------------------------
+    def position(self, t: float) -> np.ndarray:
+        """(x, y=0, z) at arc-length fraction *t* ∈ [0, 1]."""
+        t = float(np.clip(t, 0, 1))
+        x = np.interp(t, self._t_table, self._pts[:, 0])
+        z = np.interp(t, self._t_table, self._pts[:, 2])
+        return np.array([x, 0.0, z])
+
+    def positions(self, t_arr: np.ndarray) -> np.ndarray:
+        """Vectorised: (N, 3) positions at an array of *t* values."""
+        t_arr = np.clip(np.asarray(t_arr, dtype=float), 0, 1)
+        x = np.interp(t_arr, self._t_table, self._pts[:, 0])
+        z = np.interp(t_arr, self._t_table, self._pts[:, 2])
+        return np.column_stack([x, np.zeros_like(x), z])
+
+    def t_at_x(self, x_meters: float) -> float:
+        """Inverse lookup: x [m] → arc-length fraction *t*."""
+        return float(np.interp(x_meters, self._pts[:, 0], self._t_table))
+
+    def segment_at(self, t: float) -> str:
+        """Name of the segment at *t*: intake / sduct / housing / nozzle."""
+        if t <= self._t_ramp_end:
+            return "intake"
+        elif t <= self._t_housing_start:
+            return "sduct"
+        elif t <= self._t_housing_end:
+            return "housing"
+        else:
+            return "nozzle"
+
+    # ------------------------------------------------------------------
+    # Radius (half-height for clearance / envelope)
+    # ------------------------------------------------------------------
+    def radius(self, t: float, radius_mode: str = "structural") -> float:
+        """Effective duct half-height at *t*.
+
+        Returns the vertical half-extent of the cross-section, consistent
+        with what ``cross_section(t)`` produces:
+
+          intake  → rect half-height (intake_depth × frac / 2)
+          sduct   → blend rect half-height → circle radius
+          housing → circle radius
+          nozzle  → cosine blend circle → exhaust_height / 2
+
+        Parameters
+        ----------
+        radius_mode : 'structural' or 'flow'
+        """
+        r = self._r_structural if radius_mode == "structural" else self._r_flow
+
+        if t <= 0:
+            return 0.0
+        if t < self._t_ramp_end:
+            # Intake: rectangular section, half-height grows with frac
+            frac = t / self._t_ramp_end
+            return self._p.intake_depth * frac / 2
+        if t <= self._t_housing_start:
+            # S-duct: blend from rect half-height to circle radius
+            span = self._t_housing_start - self._t_ramp_end
+            blend = (t - self._t_ramp_end) / span if span > 1e-9 else 1.0
+            rect_hh = self._p.intake_depth / 2
+            return rect_hh * (1 - blend) + r * blend
+        if t <= self._t_housing_end:
+            return r
+        # Nozzle taper: cosine blend to exhaust half-height
+        s = (t - self._t_housing_end) / max(1.0 - self._t_housing_end, 1e-9)
+        blend = 0.5 * (1 - np.cos(np.pi * s))
+        return r * (1 - blend) + (self._p.exhaust_height / 2) * blend
+
+    # ------------------------------------------------------------------
+    # Cross-sections
+    # ------------------------------------------------------------------
+    def cross_section(self, t: float, n_pts: int = 48,
+                      radius_mode: str = "flow") -> np.ndarray:
+        """2-D cross-section (n_pts, 2) in local (horiz, vert) frame.
+
+        Shape varies with segment:
+          intake  → rectangular, opening up
+          sduct   → superellipse blend rect → circle
+          housing → circle
+          nozzle  → circle → exhaust ellipse
+        """
+        p = self._p
+        r = self._r_structural if radius_mode == "structural" else self._r_flow
+
+        if t <= self._t_ramp_end:
+            # Intake: rectangle opening from zero to full
+            frac = t / self._t_ramp_end if self._t_ramp_end > 1e-9 else 1.0
+            frac = max(frac, 0.01)
+            # Use blend_rect_circle at blend=0 for C0 continuity with sduct
+            w = p.intake_width / 2 * frac
+            h = p.intake_depth * frac
+            return _blend_rect_circle(w, h, r, 0.0, n_pts)
+
+        if t <= self._t_housing_start:
+            # S-duct: rect → circle blend
+            span = self._t_housing_start - self._t_ramp_end
+            blend = (t - self._t_ramp_end) / span if span > 1e-9 else 1.0
+            return _blend_rect_circle(
+                p.intake_width / 2, p.intake_depth, r, blend, n_pts)
+
+        if t <= self._t_housing_end:
+            # Housing: pure circle
+            theta = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
+            return np.column_stack([r * np.cos(theta), r * np.sin(theta)])
+
+        # Nozzle: circle → area-preserving flat ellipse
+        # Height blends toward exhaust target; width adjusts to conserve area.
+        span = 1.0 - self._t_housing_end
+        blend = (t - self._t_housing_end) / span if span > 1e-9 else 1.0
+        b = p.exhaust_height / 2 * blend + r * (1 - blend)
+        fan_area = np.pi * r ** 2
+        exit_area = p.exhaust_width * p.exhaust_height
+        target_area = fan_area * (1 - blend) + exit_area * blend
+        a = target_area / (np.pi * max(b, 1e-6))
+        theta = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
+        return np.column_stack([a * np.cos(theta), b * np.sin(theta)])
+
+    def section_3d(self, t: float, n_pts: int = 48,
+                   radius_mode: str = "flow") -> np.ndarray:
+        """3-D section (n_pts, 3): cross-section placed at position(t).
+
+        Applies body twist rotation (same as STL body export) so the duct
+        mesh is consistent with the body mesh.
+        """
+        pos = self.position(t)
+        cs = self.cross_section(t, n_pts, radius_mode)
+        # Place section in un-twisted body coordinates
+        x_local = pos[0]
+        z_local = cs[:, 1] + pos[2]
+        # Apply body twist around LE (x=0, z=0) — matches export.py
+        tw = self._body_twist_rad
+        x_rot = x_local * np.cos(tw) + z_local * np.sin(tw)
+        z_rot = -x_local * np.sin(tw) + z_local * np.cos(tw)
+        return np.column_stack([x_rot, cs[:, 0], z_rot])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Structure mass
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -292,36 +571,27 @@ def validate_duct_clearance(placement: DuctPlacement, params: BWBParams,
                             n_stations: int = 50) -> tuple[bool, list[ClearanceResult]]:
     """Check duct-to-body clearance at axial stations along the duct.
 
+    Uses DuctSpine for consistent centerline and radius queries.
     Returns (all_ok, list[ClearanceResult]).
     """
+    spine = DuctSpine(placement)
     _cache = _build_body_surface_cache(params)
     bc = placement.body_chord
-    cl = compute_duct_centerline(placement, n_pts=n_stations)
 
+    t_arr = np.linspace(0, 1, n_stations)
     results = []
     all_ok = True
-    for i in range(len(cl)):
-        x_abs = cl[i, 0]
-        z_center = cl[i, 2]
+    for t in t_arr:
+        pos = spine.position(t)
+        x_abs = pos[0]
+        z_center = pos[2]
         x_frac = x_abs / bc
 
         if x_frac < 0.01 or x_frac > 0.99:
             continue
 
         z_up, _, z_lo = _body_surface_z(x_frac, params, _cache)
-
-        # Interpolate duct half-height along path
-        t = i / max(len(cl) - 1, 1)
-        duct_r = placement.duct_od / 2 + placement.duct_wall_thickness
-        # Duct radius tapers at intake and exhaust
-        if t < 0.15:
-            duct_hh = duct_r * (t / 0.15)  # intake opens up
-        elif t > 0.85:
-            s = (t - 0.85) / 0.15
-            blend = 0.5 * (1 - np.cos(np.pi * s))
-            duct_hh = duct_r * (1 - blend) + (placement.exhaust_height / 2) * blend
-        else:
-            duct_hh = duct_r
+        duct_hh = spine.radius(t, radius_mode="structural")
 
         clr_top = (z_up * bc - (z_center + duct_hh)) * 1000
         clr_bot = ((z_center - duct_hh) - z_lo * bc) * 1000
@@ -358,50 +628,10 @@ def compute_duct_centerline(placement: DuctPlacement,
                             n_pts: int = 60) -> np.ndarray:
     """Duct centerline as (n_pts, 3) array [x, y=0, z] in meters.
 
-    Two cubic Bezier segments:
-    1. Intake → Fan (S-duct: diving)
-    2. Fan → Exhaust (nozzle: roughly level)
+    Delegates to DuctSpine for arc-length-uniform sampling.
     """
-    p = placement
-
-    # Segment 0: intake ramp — quadratic descent (matches build_intake_geometry)
-    ramp_end_x = p.intake_x + p.intake_length
-    ramp_end_z = p.intake_z - p.intake_depth  # bottom of ramp at frac=1
-    n0 = max(n_pts // 6, 4)
-
-    # Segment 1: ramp bottom → fan face (S-duct Bezier)
-    p0 = np.array([ramp_end_x, 0.0, ramp_end_z])
-    p3 = np.array([p.fan_x, 0.0, p.fan_z])
-    dx = p3[0] - p0[0]
-    # Tangent at ramp end: dz/dx = -2*depth/length (quadratic derivative at frac=1)
-    ramp_slope = -2 * p.intake_depth / max(p.intake_length, 1e-6)
-    ramp_end_dir = np.array([1.0, 0.0, ramp_slope])
-    ramp_end_dir /= np.linalg.norm(ramp_end_dir)
-    p1 = p0 + ramp_end_dir * dx * 0.4
-    p2 = p3 + np.array([-dx * 0.4, 0.0, 0.0])
-
-    n1 = (n_pts - n0) * 2 // 3
-    seg1 = _cubic_bezier(p0, p1, p2, p3, n1)
-
-    # Segment 2: fan face → exhaust (nozzle Bezier)
-    q0 = p3.copy()
-    q3 = np.array([p.exhaust_x, 0.0, p.exhaust_z])
-    dx2 = q3[0] - q0[0]
-    q1 = q0 + np.array([dx2 * 0.3, 0.0, 0.0])
-    q2 = q3 + np.array([-dx2 * 0.3, 0.0, 0.0])
-
-    n2 = n_pts - n0 - n1
-    seg2 = _cubic_bezier(q0, q1, q2, q3, max(n2, 4))
-
-    # Intake ramp: quadratic z = intake_z - depth * frac² (NACA scoop profile)
-    frac_arr = np.linspace(0, 1, n0)
-    seg0 = np.column_stack([
-        p.intake_x + frac_arr * p.intake_length,
-        np.zeros(n0),
-        p.intake_z - p.intake_depth * frac_arr ** 2,
-    ])
-
-    return np.vstack([seg0, seg1[1:], seg2[1:]])
+    spine = DuctSpine(placement)
+    return spine.positions(np.linspace(0, 1, n_pts))
 
 
 def _cubic_bezier(p0, p1, p2, p3, n: int) -> np.ndarray:
@@ -417,38 +647,13 @@ def _cubic_bezier(p0, p1, p2, p3, n: int) -> np.ndarray:
 
 def duct_cross_section(t: float, placement: DuctPlacement,
                        n_pts: int = 48) -> np.ndarray:
-    """2D cross-section at parametric station t ∈ [0, 1].
+    """2D cross-section at arc-length fraction t ∈ [0, 1].
 
-    t=0: intake (rectangular), t=0.5: fan face (circular), t=1: exhaust (elliptical).
+    Delegates to DuctSpine for segment-aware cross-sections.
     Returns (n_pts, 2) array in local (horizontal, vertical) frame.
     """
-    p = placement
-
-    if t < 0.25:
-        # Intake → rectangular, opening up
-        frac = t / 0.25
-        w = p.intake_width / 2 * max(frac, 0.15)
-        h = p.intake_depth * max(frac, 0.05)
-        return _rect_section(w, h, n_pts)
-    elif t < 0.5:
-        # Transition rectangular → circular
-        blend = (t - 0.25) / 0.25
-        r = p.fan_diameter / 2
-        return _blend_rect_circle(
-            p.intake_width / 2, p.intake_depth, r, blend, n_pts)
-    elif t < 0.75:
-        # Circular (fan zone)
-        r = p.fan_diameter / 2
-        theta = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
-        return np.column_stack([r * np.cos(theta), r * np.sin(theta)])
-    else:
-        # Transition circular → exhaust ellipse
-        blend = (t - 0.75) / 0.25
-        r = p.fan_diameter / 2
-        a = p.exhaust_width / 2 * blend + r * (1 - blend)
-        b = p.exhaust_height / 2 * blend + r * (1 - blend)
-        theta = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
-        return np.column_stack([a * np.cos(theta), b * np.sin(theta)])
+    spine = DuctSpine(placement)
+    return spine.cross_section(t, n_pts, radius_mode="flow")
 
 
 def _rect_section(half_w: float, height: float, n_pts: int) -> np.ndarray:
@@ -485,97 +690,38 @@ def _blend_rect_circle(half_w, depth, radius, blend, n_pts):
 
 def build_intake_geometry(placement: DuctPlacement, params: BWBParams,
                           n_profile: int = 32, n_axial: int = 8) -> list[np.ndarray]:
-    """Build intake cross-sections as 3D arrays for lofting."""
-    p = placement
-    sections = []
-    for i in range(n_axial):
-        frac = i / max(n_axial - 1, 1)
-        x = p.intake_x + frac * p.intake_length
-        z = p.intake_z - p.intake_depth * frac ** 2  # quadratic ramp
-        cs = duct_cross_section(frac * 0.25, p, n_pts=n_profile)
-        # Place in 3D
-        sec = np.column_stack([
-            np.full(len(cs), x),
-            cs[:, 0],
-            cs[:, 1] + z,
-        ])
-        sections.append(sec)
-    return sections
+    """Build intake cross-sections — segment [0, t_ramp_end]."""
+    spine = DuctSpine(placement)
+    t_arr = np.linspace(0, spine.t_ramp_end, n_axial)
+    return [spine.section_3d(t, n_profile) for t in t_arr]
 
 
 def build_sduct_geometry(placement: DuctPlacement, params: BWBParams,
                          edf: EDFSpec,
                          n_stations: int = 12,
                          n_profile: int = 32) -> list[np.ndarray]:
-    """Build S-duct cross-sections along the centerline."""
-    p = placement
-    cl = compute_duct_centerline(p, n_pts=100)
-    # Sample stations in the S-duct region (t ≈ 0.25 to 0.50)
-    n_cl = len(cl)
-    indices = np.linspace(0, n_cl * 2 // 3, n_stations, dtype=int)
-
-    sections = []
-    for idx in indices:
-        idx = min(idx, n_cl - 1)
-        t_param = 0.25 + (idx / n_cl) * 0.5  # map to cross-section parameter
-        t_param = min(t_param, 0.50)
-        cs = duct_cross_section(t_param, p, n_pts=n_profile)
-        sec = np.column_stack([
-            np.full(len(cs), cl[idx, 0]),
-            cs[:, 0],
-            cs[:, 1] + cl[idx, 2],
-        ])
-        sections.append(sec)
-    return sections
+    """Build S-duct cross-sections — segment [t_ramp_end, t_housing_start]."""
+    spine = DuctSpine(placement)
+    t_arr = np.linspace(spine.t_ramp_end, spine.t_housing_start, n_stations)
+    return [spine.section_3d(t, n_profile) for t in t_arr]
 
 
 def build_edf_housing(placement: DuctPlacement, edf: EDFSpec,
                       n_profile: int = 32, n_axial: int = 4) -> list[np.ndarray]:
-    """Build cylindrical EDF housing sections."""
-    p = placement
-    r = edf.fan_diameter / 2
-    theta = np.linspace(0, 2 * np.pi, n_profile, endpoint=False)
-    cx = r * np.cos(theta)
-    cy = r * np.sin(theta)
-
-    x_start = p.fan_x - p.housing_length / 2
-    sections = []
-    for i in range(n_axial):
-        frac = i / max(n_axial - 1, 1)
-        x = x_start + frac * p.housing_length
-        sec = np.column_stack([
-            np.full(n_profile, x),
-            cx,
-            cy + p.fan_z,
-        ])
-        sections.append(sec)
-    return sections
+    """Build EDF housing sections — segment [t_housing_start, t_housing_end]."""
+    spine = DuctSpine(placement)
+    t_arr = np.linspace(spine.t_housing_start, spine.t_housing_end, n_axial)
+    return [spine.section_3d(t, n_profile) for t in t_arr]
 
 
 def build_exhaust_geometry(placement: DuctPlacement, params: BWBParams,
                            edf: EDFSpec,
                            n_stations: int = 8,
                            n_profile: int = 32) -> list[np.ndarray]:
-    """Build exhaust nozzle sections (fan → exit slot)."""
-    p = placement
-    cl = compute_duct_centerline(p, n_pts=100)
-    n_cl = len(cl)
-    # Exhaust region: last third of centerline
-    indices = np.linspace(n_cl * 2 // 3, n_cl - 1, n_stations, dtype=int)
-
-    sections = []
-    for idx in indices:
-        idx = min(idx, n_cl - 1)
-        t_param = 0.50 + (idx - n_cl * 2 // 3) / (n_cl // 3) * 0.50
-        t_param = min(t_param, 1.0)
-        cs = duct_cross_section(t_param, p, n_pts=n_profile)
-        sec = np.column_stack([
-            np.full(len(cs), cl[idx, 0]),
-            cs[:, 0],
-            cs[:, 1] + cl[idx, 2],
-        ])
-        sections.append(sec)
-    return sections
+    """Build nozzle sections — segment [t_housing_end, 1.0]."""
+    spine = DuctSpine(placement)
+    t_arr = np.linspace(spine.t_housing_end, 1.0, n_stations)
+    return [spine.section_3d(t, n_profile) for t in t_arr]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -584,27 +730,31 @@ def build_exhaust_geometry(placement: DuctPlacement, params: BWBParams,
 
 def build_propulsion_mesh(params: BWBParams, edf: EDFSpec,
                           n_profile: int = 32) -> list:
-    """Build complete duct as triangle list for STL export."""
+    """Build complete duct as watertight triangle list for STL export.
+
+    Uses continuous lofting across all 4 segments — no inter-component gaps.
+    """
     from ..config import duct_from_config, load_config
     _cfg = duct_from_config(load_config())
     placement = size_and_place_duct(params, edf, config=_cfg)
+    spine = DuctSpine(placement, body_twist_deg=params.body_twist)
+
+    # Single continuous t-array with shared boundary points (no duplicates)
+    t_intake = np.linspace(0, spine.t_ramp_end, 8)
+    t_sduct = np.linspace(spine.t_ramp_end, spine.t_housing_start, 16)[1:]
+    t_housing = np.linspace(spine.t_housing_start, spine.t_housing_end, 4)[1:]
+    t_exhaust = np.linspace(spine.t_housing_end, 1.0, 10)[1:]
+    t_all = np.concatenate([t_intake, t_sduct, t_housing, t_exhaust])
+
+    sections = [spine.section_3d(t, n_profile) for t in t_all]
+
     triangles = []
-
-    components = [
-        build_intake_geometry(placement, params, n_profile=n_profile, n_axial=8),
-        build_sduct_geometry(placement, params, edf, n_stations=16, n_profile=n_profile),
-        build_edf_housing(placement, edf, n_profile=n_profile, n_axial=4),
-        build_exhaust_geometry(placement, params, edf, n_stations=10, n_profile=n_profile),
-    ]
-
-    for secs in components:
-        for i in range(len(secs) - 1):
-            _loft_sections(secs[i], secs[i + 1], triangles)
+    for i in range(len(sections) - 1):
+        _loft_sections(sections[i], sections[i + 1], triangles)
     # Cap ends
-    if components[0]:
-        _cap_section(components[0][0], triangles, flip=True)
-    if components[-1]:
-        _cap_section(components[-1][-1], triangles, flip=False)
+    if sections:
+        _cap_section(sections[0], triangles, flip=True)
+        _cap_section(sections[-1], triangles, flip=False)
 
     return triangles
 

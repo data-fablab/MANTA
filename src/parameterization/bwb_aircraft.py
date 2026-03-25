@@ -332,6 +332,7 @@ def apply_duct_bump(coords_2d: np.ndarray, placement, body_chord: float,
                     body_halfwidth: float, station_y: float) -> np.ndarray:
     """Raise upper surface where the duct protrudes above body OML.
 
+    Uses DuctSpine for consistent Bezier centerline (not linear interp).
     Applies a smooth cosine fairing on the upper surface between
     intake_x_frac and exhaust_x_frac.  The bump height tapers to zero
     at the body halfwidth (duct is centered at y=0).
@@ -351,10 +352,11 @@ def apply_duct_bump(coords_2d: np.ndarray, placement, body_chord: float,
     if placement is None or station_y >= body_halfwidth:
         return coords_2d
 
+    from ..propulsion.duct_geometry import DuctSpine
+    spine = DuctSpine(placement)
+
     result = coords_2d.copy()
     mid = np.argmin(result[:, 0])  # LE index
-
-    duct_r = placement.duct_od / 2 + placement.duct_wall_thickness
 
     # Spanwise taper: bump full at y=0, zero at body_halfwidth
     y_taper = max(0.0, 1.0 - station_y / body_halfwidth)
@@ -369,15 +371,13 @@ def apply_duct_bump(coords_2d: np.ndarray, placement, body_chord: float,
     for j in range(len(x_up)):
         xc = x_up[j]
         if x_start <= xc <= x_end:
-            # Duct centerline z/c (linear interp intake→fan→exhaust)
-            if xc <= placement.fan_x_frac:
-                t = (xc - x_start) / max(placement.fan_x_frac - x_start, 1e-6)
-                duct_center_z = (placement.intake_z + t * (placement.fan_z - placement.intake_z)) / body_chord
-            else:
-                t = (xc - placement.fan_x_frac) / max(x_end - placement.fan_x_frac, 1e-6)
-                duct_center_z = (placement.fan_z + t * (placement.exhaust_z - placement.fan_z)) / body_chord
-
+            # Duct centerline z/c from spine (follows Bezier, not linear)
+            t = spine.t_at_x(xc * body_chord)
+            pos = spine.position(t)
+            duct_center_z = pos[2] / body_chord
+            duct_r = spine.radius(t, radius_mode="structural")
             duct_top_zc = duct_center_z + duct_r / body_chord
+
             protrusion = duct_top_zc - z_up[j]
             if protrusion > 0:
                 frac = (xc - x_start) / max(x_end - x_start, 1e-6)

@@ -229,11 +229,11 @@ def endurance(drag: float, velocity: float, edf: EDFSpec,
 
 
 
-def intake_drag(edf: EDFSpec, s_ref: float, cd_intake_coeff: float = 0.05) -> float:
+def intake_drag(edf: EDFSpec, s_ref: float, cd_intake_coeff: float = 0.06) -> float:
     """Estimate intake drag coefficient increment.
 
-    NACA submerged intake drag: CD_intake ≈ cd_intake_coeff * A_intake / S_ref
-    Typical cd_intake_coeff for flush NACA intake: 0.04 - 0.06.
+    Scoop lip intake drag: CD_intake ≈ cd_intake_coeff * A_intake / S_ref
+    Typical cd_intake_coeff for scoop intake: 0.05 - 0.07.
     """
     a_intake = np.pi / 4 * edf.intake_diameter**2
     return cd_intake_coeff * a_intake / s_ref if s_ref > 0 else 0.0

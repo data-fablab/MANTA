@@ -1,21 +1,20 @@
 """Parametric duct geometry for dorsal EDF propulsion.
 
 Physics-based sizing and placement of the internal flow path:
-    Dorsal NACA intake → S-duct → EDF housing → Convergent nozzle
+    Semi-circular lip scoop intake → S-duct → EDF housing → Convergent nozzle
 
 Sizing sequence (first-principles):
 1. Fan area from EDF spec
 2. Intake area from capture ratio (A_intake = A_fan × capture_ratio)
-3. Intake depth from width/depth ratio + ramp angle
+3. Intake depth from width/depth ratio, length from chord fraction
 4. Intake placement: scan body for sufficient height margin
-5. Fan placement: maximize clearance, not body height
+5. Fan placement: maximize clearance, min S-duct length enforced
 6. S-duct: route with offset/length < 0.25 (Seddon)
 7. Nozzle: converge to exit area ratio
 8. Exhaust: TE slot
 
 References:
-- NACA RM-A7I30: flush intake geometry
-- Seddon & Goldsmith, "Intake Aerodynamics": S-duct correlations
+- Seddon & Goldsmith, "Intake Aerodynamics": scoop intake, S-duct correlations
 - NASA TN-D-4014: ducted fan performance
 
 Coordinate system (same as bwb_aircraft.py):
@@ -67,6 +66,7 @@ class DuctPlacement:
     housing_length: float         # [m] EDF cylindrical section
     body_chord: float             # [m] reference
     intake_fallback: bool = False # True if no suitable intake location found
+    body_twist_deg: float = 0.0  # [deg] body twist for nozzle exit compensation
 
 
 @dataclass
@@ -146,7 +146,7 @@ def size_and_place_duct(params: BWBParams, edf: EDFSpec,
     fan_area = np.pi / 4 * edf.fan_diameter ** 2
     intake_area = fan_area * config.intake_capture_ratio
 
-    # ── Step 2: Intake geometry from NACA guidelines ──
+    # ── Step 2: Intake geometry (scoop lip) ──
     # Width/depth ratio → depth = sqrt(intake_area / W_D_ratio)
     w_d = config.intake_width_depth_ratio
     intake_depth = np.sqrt(intake_area / w_d)
@@ -156,13 +156,8 @@ def size_and_place_duct(params: BWBParams, edf: EDFSpec,
     if intake_width > max_w:
         intake_width = max_w
         intake_depth = intake_area / intake_width
-    # Ramp length from ramp angle, capped at 20% of chord
-    # (NACA 5-7° is for full-scale; small UAVs need steeper ramps)
-    ramp_angle_rad = np.radians(config.intake_ramp_angle_deg)
-    intake_length = intake_depth / np.tan(ramp_angle_rad)
-    max_intake_length = 0.20 * body_chord
-    if intake_length > max_intake_length:
-        intake_length = max_intake_length
+    # Scoop length as fraction of chord
+    intake_length = config.intake_length_frac * body_chord
 
     # ── Step 3: Intake placement — find x/c where body is deep enough ──
     min_body_margin = config.intake_min_body_margin_mm / 1000.0
@@ -187,9 +182,10 @@ def size_and_place_duct(params: BWBParams, edf: EDFSpec,
     duct_radius = edf.duct_outer_diameter / 2 + duct_wall
     min_clearance = config.fan_clearance_min_mm / 1000.0
 
-    # Minimum S-duct length from offset/length constraint
-    # We'll check this after finding the fan position
-    min_fan_x_frac = intake_end_frac + 0.10  # at least 10% chord S-duct
+    # Minimum S-duct length from duct diameter (Seddon guideline)
+    duct_od_struct = edf.duct_outer_diameter + 2 * duct_wall
+    min_sduct_length = config.min_sduct_length_factor * duct_od_struct
+    min_fan_x_frac = intake_end_frac + min_sduct_length / body_chord
 
     best_fan_x_frac = 0.40  # fallback
     best_clearance = -np.inf
@@ -254,6 +250,7 @@ def size_and_place_duct(params: BWBParams, edf: EDFSpec,
         exhaust_width=exhaust_width, exhaust_height=exhaust_height,
         duct_wall_thickness=duct_wall, housing_length=housing_length,
         body_chord=body_chord, intake_fallback=intake_fallback,
+        body_twist_deg=params.body_twist,
     )
 
 
@@ -289,49 +286,60 @@ class DuctSpine:
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
-    def __init__(self, placement: DuctPlacement, body_twist_deg: float = 0.0,
+    def __init__(self, placement: DuctPlacement, body_twist_deg: float = None,
                  n_table: int = 500):
         p = self._p = placement
+        if body_twist_deg is None:
+            body_twist_deg = getattr(placement, 'body_twist_deg', 0.0)
         self._body_twist_rad = np.radians(body_twist_deg)
 
-        # ── Build the three geometric curves ──────────────────────────
-        # seg0: intake ramp — quadratic z = intake_z - depth * frac²
-        ramp_end_x = p.intake_x + p.intake_length
-        ramp_end_z = p.intake_z - p.intake_depth
+        # ── Build the two geometric curves ───────────────────────────
+        # seg0: single Bézier  intake lip → fan face
+        #
+        # Replaces the old linear ramp + S-duct Bézier.  A single smooth
+        # curve from the dorsal surface down to the fan eliminates the
+        # artificial "dip" that the two-piece approach created.
+        #
+        # P0 = intake lip (on upper OML)
+        # P1 = gentle scoop entry (~7° NACA ramp angle)
+        # P2 = horizontal approach to fan (uniform axial inflow)
+        # P3 = fan face center
+        #
+        # Monotonicity: P0_z > P1_z > P2_z = P3_z  →  all control
+        # points descend  →  dz/dt < 0  ∀ t∈(0,1).
+        ramp_end_x = p.intake_x + p.intake_length   # kept for housing clamp
 
-        n0 = max(n_table // 5, 20)
-        frac0 = np.linspace(0, 1, n0)
-        seg0 = np.column_stack([
-            p.intake_x + frac0 * p.intake_length,
-            np.zeros(n0),
-            p.intake_z - p.intake_depth * frac0 ** 2,
-        ])
-
-        # seg1: S-duct cubic Bezier  (ramp bottom → fan face)
-        p0 = np.array([ramp_end_x, 0.0, ramp_end_z])
+        p0 = np.array([p.intake_x, 0.0, p.intake_z])
         p3 = np.array([p.fan_x, 0.0, p.fan_z])
         dx = p3[0] - p0[0]
-        ramp_slope = -2 * p.intake_depth / max(p.intake_length, 1e-6)
-        ramp_dir = np.array([1.0, 0.0, ramp_slope])
-        ramp_dir /= np.linalg.norm(ramp_dir)
-        self._bez1 = (p0, p0 + ramp_dir * dx * 0.4,
-                       p3 + np.array([-dx * 0.4, 0.0, 0.0]), p3)
+        scoop_slope = -np.tan(np.radians(7))        # NACA 7° ramp
+        p1 = p0 + np.array([dx * 0.35, 0.0, dx * 0.35 * scoop_slope])
+        # Clamp P1_z between P0_z and P3_z (safety for extreme geometries)
+        p1[2] = np.clip(p1[2], min(p0[2], p3[2]), max(p0[2], p3[2]))
+        p2 = p3 - np.array([dx * 0.35, 0.0, 0.0])
+        self._bez1 = (p0, p1, p2, p3)
 
-        n1 = max(n_table * 2 // 5, 40)
-        seg1 = _cubic_bezier(*self._bez1, n1)
+        n01 = max(n_table * 3 // 5, 60)
+        seg01 = _cubic_bezier(*self._bez1, n01)
 
         # seg2: nozzle cubic Bezier  (fan face → exhaust)
+        # Exit tangent compensates body twist so that in the physical
+        # (twisted) frame the nozzle points horizontally — thrust is
+        # parallel to the fuselage axis, as per standard practice.
+        # Math: R(tw)·(cos tw, sin tw) = (1, 0)  ✓
         q0 = p3.copy()
         q3 = np.array([p.exhaust_x, 0.0, p.exhaust_z])
         dx2 = q3[0] - q0[0]
+        tw = self._body_twist_rad
+        exit_dir = np.array([np.cos(tw), 0.0, np.sin(tw)])
         self._bez2 = (q0, q0 + np.array([dx2 * 0.3, 0.0, 0.0]),
-                       q3 + np.array([-dx2 * 0.3, 0.0, 0.0]), q3)
+                       q3 - exit_dir * dx2 * 0.3, q3)
 
-        n2 = n_table - n0 - n1
+        n2 = n_table - n01
         seg2 = _cubic_bezier(*self._bez2, max(n2, 20))
 
-        # Concatenate (removing duplicate junction points)
-        self._pts = np.vstack([seg0, seg1[1:], seg2[1:]])
+        # Concatenate (removing duplicate junction point)
+        self._pts = np.vstack([seg01, seg2[1:]])
         n_total = len(self._pts)
 
         # ── Arc-length table ──────────────────────────────────────────
@@ -344,17 +352,22 @@ class DuctSpine:
         self._t_table = cum / total_len         # normalised to [0, 1]
 
         # ── Segment boundaries in t-space ─────────────────────────────
-        # seg0 has n0 points → last index of seg0 = n0 - 1
-        self._idx_ramp_end = n0 - 1
-        # seg1[1:] adds n1-1 points → last index = n0-1 + n1-1
-        self._idx_fan_face = n0 - 1 + n1 - 1
+        # "ramp end" = where x reaches intake_x + intake_length on the
+        # single Bézier.  This is where the lip is fully open and the
+        # rect → circle transition begins.
+        self._idx_ramp_end = int(np.searchsorted(
+            self._pts[:, 0], ramp_end_x).clip(0, n_total - 1))
+        # fan face = end of seg01
+        self._idx_fan_face = n01 - 1
 
         self._t_ramp_end = self._t_table[self._idx_ramp_end]
         self._t_fan_face = self._t_table[self._idx_fan_face]
 
         # Housing boundaries in x-space → map to t
-        housing_x_start = p.fan_x - p.housing_length / 2
-        housing_x_end = p.fan_x + p.housing_length / 2
+        # Asymmetric: 30% fore / 70% aft of fan face (motor geometry)
+        motor_fore = 0.3
+        housing_x_start = p.fan_x - p.housing_length * motor_fore
+        housing_x_end = p.fan_x + p.housing_length * (1.0 - motor_fore)
         # Clamp: housing can't start before ramp end or extend past exhaust
         housing_x_start = max(housing_x_start, ramp_end_x)
         housing_x_end = min(housing_x_end, p.exhaust_x)
@@ -364,7 +377,7 @@ class DuctSpine:
         self._t_housing_end = float(np.interp(
             housing_x_end, self._pts[:, 0], self._t_table))
 
-        # Clamp: S-duct must have non-zero length
+        # Clamp: transition region must have non-zero length
         if self._t_housing_start <= self._t_ramp_end + 1e-6:
             self._t_housing_start = self._t_ramp_end + 1e-6
         if self._t_housing_end <= self._t_housing_start + 1e-6:
@@ -454,11 +467,10 @@ class DuctSpine:
         r = self._r_structural if radius_mode == "structural" else self._r_flow
 
         if t <= 0:
-            return 0.0
+            return self._p.intake_depth / 2
         if t < self._t_ramp_end:
-            # Intake: rectangular section, half-height grows with frac
-            frac = t / self._t_ramp_end
-            return self._p.intake_depth * frac / 2
+            # Intake scoop: full-size section from the lip
+            return self._p.intake_depth / 2
         if t <= self._t_housing_start:
             # S-duct: blend from rect half-height to circle radius
             span = self._t_housing_start - self._t_ramp_end
@@ -480,7 +492,7 @@ class DuctSpine:
         """2-D cross-section (n_pts, 2) in local (horiz, vert) frame.
 
         Shape varies with segment:
-          intake  → rectangular, opening up
+          intake  → semi-circular lip → rectangular (full size)
           sduct   → superellipse blend rect → circle
           housing → circle
           nozzle  → circle → exhaust ellipse
@@ -489,13 +501,14 @@ class DuctSpine:
         r = self._r_structural if radius_mode == "structural" else self._r_flow
 
         if t <= self._t_ramp_end:
-            # Intake: rectangle opening from zero to full
+            # Intake scoop: full-size section with lip blend
             frac = t / self._t_ramp_end if self._t_ramp_end > 1e-9 else 1.0
             frac = max(frac, 0.01)
-            # Use blend_rect_circle at blend=0 for C0 continuity with sduct
-            w = p.intake_width / 2 * frac
-            h = p.intake_depth * frac
-            return _blend_rect_circle(w, h, r, 0.0, n_pts)
+            w = p.intake_width / 2
+            h = p.intake_depth
+            # Lip: semi-circular (blend=1) at entrance → rectangular (blend=0)
+            lip_blend = max(0.0, 1.0 - frac * 3)
+            return _blend_rect_circle(w, h, r, lip_blend, n_pts)
 
         if t <= self._t_housing_start:
             # S-duct: rect → circle blend
@@ -538,6 +551,21 @@ class DuctSpine:
         x_rot = x_local * np.cos(tw) + z_local * np.sin(tw)
         z_rot = -x_local * np.sin(tw) + z_local * np.cos(tw)
         return np.column_stack([x_rot, cs[:, 0], z_rot])
+
+    def exhaust_angle_physical_deg(self) -> float:
+        """Nozzle exit angle in the physical (twisted) frame [deg].
+
+        With body-twist compensation of the Bezier, this should be
+        approximately 0° (thrust parallel to fuselage axis).
+        """
+        n = len(self._pts)
+        p1 = self.position(1.0)
+        p0 = self.position(1.0 - 2.0 / n)
+        dx, dz = p1[0] - p0[0], p1[2] - p0[2]
+        tw = self._body_twist_rad
+        dx_r = dx * np.cos(tw) + dz * np.sin(tw)
+        dz_r = -dx * np.sin(tw) + dz * np.cos(tw)
+        return float(np.degrees(np.arctan2(dz_r, dx_r)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

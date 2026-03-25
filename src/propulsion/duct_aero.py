@@ -111,18 +111,10 @@ def compute_duct_aero(placement: DuctPlacement, edf: EDFSpec,
         )
 
     # ── Intake pressure recovery ──
-    # NACA flush intake: PR depends on BL state (Re-dependent).
-    # At Re < 200k (typical for small UAV at 25 m/s, 0.1 m scale),
-    # BL is transitional → lower PR than high-Re NACA data.
-    # Ref: Seddon & Goldsmith, ch. 4 (flush intake correlation)
-    intake_chord = placement.intake_length
-    re_intake = velocity * intake_chord / (MU_SEA_LEVEL / rho) if velocity > 0.5 else 0
-    if re_intake > 5e5:
-        pr_intake = config.pr_intake  # turbulent BL: use configured value
-    elif re_intake > 1e5:
-        pr_intake = config.pr_intake - 0.02  # transitional: slight penalty
-    else:
-        pr_intake = config.pr_intake - 0.04  # laminar/low Re: more loss
+    # Scoop lip intake: captures freestream air directly, less Re-sensitive
+    # than flush intakes. PR set from config (typ. 0.96 for lip scoop).
+    # Ref: Seddon & Goldsmith, ch. 5
+    pr_intake = config.pr_intake
 
     # ── S-duct pressure recovery ──
     # Seddon & Goldsmith: dp/q = K × (offset/L)²

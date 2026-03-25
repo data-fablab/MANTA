@@ -15,7 +15,13 @@ from .edf_model import (
 def compute_propulsion_balance(drag_force, velocity: float,
                                edf: EDFSpec, battery: BatterySpec,
                                pr_total: float = 1.0,
-                               velocity_ratio: float = 1.5) -> dict:
+                               velocity_ratio: float = 1.5,
+                               alpha_deg: float = 0.0,
+                               x_thrust: float = 0.0,
+                               z_thrust: float = 0.0,
+                               x_cg: float = 0.0,
+                               z_cg: float = 0.0,
+                               q_S_c: float = None) -> dict:
     """Full propulsion balance from drag force.
 
     Works with scalar or numpy array `drag_force`.
@@ -27,18 +33,39 @@ def compute_propulsion_balance(drag_force, velocity: float,
     velocity_ratio : float
         V_exit / V_freestream (~1.5 for EDF 70mm at 25 m/s).
         Amplifies PR loss: ΔT/T = (1 - PR) × velocity_ratio (Mattingly).
+    alpha_deg : float
+        Cruise angle of attack [deg]. After nozzle twist compensation,
+        thrust is parallel to fuselage axis; the only misalignment with
+        the velocity vector is alpha_cruise.
+    x_thrust, z_thrust : float
+        Exhaust application point [m] in body coordinates.
+    x_cg, z_cg : float
+        Centre of gravity [m] in body coordinates.
+    q_S_c : float or None
+        Dynamic pressure × S_ref × MAC [N·m] for CM non-dimensionalisation.
 
     Returns dict with: T_available, T_over_D, P_elec, endurance_s,
-    endurance_min, range_km.
+    endurance_min, range_km, T_axial, T_normal, M_thrust, CM_thrust.
     """
     t_uninstalled = thrust_at_speed(edf, velocity)
     installation_loss = (1.0 - pr_total) * velocity_ratio
     t_avail = t_uninstalled * max(1.0 - installation_loss, 0.0)
 
+    alpha_rad = np.radians(alpha_deg)
+    cos_a = np.cos(alpha_rad)
+    sin_a = np.sin(alpha_rad)
+
     # Vectorized path
     if isinstance(drag_force, np.ndarray):
         t_available = np.full_like(drag_force, t_avail)
-        t_over_d = np.where(drag_force > 0.01, t_available / drag_force, np.inf)
+        t_axial = t_available * cos_a
+        t_normal = t_available * sin_a
+        t_over_d = np.where(drag_force > 0.01, t_axial / drag_force, np.inf)
+
+        # Pitching moment from thrust offset relative to CG
+        m_thrust = (t_available * sin_a * (x_thrust - x_cg)
+                    - t_available * cos_a * (z_thrust - z_cg))
+        cm_thrust = m_thrust / q_S_c if q_S_c is not None and q_S_c > 0 else np.zeros_like(drag_force)
 
         p_thrust = drag_force * velocity
         eta_total = edf.eta_fan * edf.eta_motor
@@ -57,7 +84,11 @@ def compute_propulsion_balance(drag_force, velocity: float,
 
         return {
             "T_available": t_available,
+            "T_axial": t_axial,
+            "T_normal": t_normal,
             "T_over_D": t_over_d,
+            "M_thrust": m_thrust,
+            "CM_thrust": cm_thrust,
             "P_elec": p_elec,
             "endurance_s": endurance_s,
             "endurance_min": endurance_min,
@@ -67,7 +98,16 @@ def compute_propulsion_balance(drag_force, velocity: float,
     # Scalar path — delegate to existing edf_model.endurance()
     prop = _compute_endurance_full(drag_force, velocity, edf, battery)
     prop["T_available"] = t_avail
-    prop["T_over_D"] = t_avail / drag_force if drag_force > 0.01 else float("inf")
+    t_axial = t_avail * cos_a
+    t_normal = t_avail * sin_a
+    prop["T_axial"] = t_axial
+    prop["T_normal"] = t_normal
+    prop["T_over_D"] = t_axial / drag_force if drag_force > 0.01 else float("inf")
+
+    m_thrust = (t_avail * sin_a * (x_thrust - x_cg)
+                - t_avail * cos_a * (z_thrust - z_cg))
+    prop["M_thrust"] = m_thrust
+    prop["CM_thrust"] = m_thrust / q_S_c if q_S_c is not None and q_S_c > 0 else 0.0
     return prop
 
 

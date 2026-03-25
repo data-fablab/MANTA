@@ -449,9 +449,19 @@ def reconstruct_aero(
 
     drag_force = cd_effective * q * s_ref
     from ..propulsion.balance import compute_propulsion_balance
+    # Approximate thrust position: exhaust at 93% chord, z ≈ 0
+    _x_thrust = body_root_chord * 0.93
+    _x_cg_prop = x_cg_real if x_cg_real is not None else body_root_chord * 0.30
+    _q_S_c = q * s_ref * mac
     _prop = compute_propulsion_balance(drag_force, mission.velocity,
                                         mission.edf, mission.battery,
-                                        pr_total=_pr_total)
+                                        pr_total=_pr_total,
+                                        alpha_deg=alpha_eq,
+                                        x_thrust=_x_thrust,
+                                        z_thrust=0.0,
+                                        x_cg=_x_cg_prop,
+                                        z_cg=0.0,
+                                        q_S_c=_q_S_c)
     t_available = _prop["T_available"]
     t_over_d = _prop["T_over_D"]
     p_elec = _prop["P_elec"]
@@ -459,6 +469,8 @@ def reconstruct_aero(
     endurance_min = _prop["endurance_min"]
     p_thrust = drag_force * mission.velocity
     range_km = _prop["range_km"]
+    cm_thrust = _prop.get("CM_thrust", np.zeros(n) if isinstance(drag_force, np.ndarray) else 0.0)
+    cm = cm + cm_thrust  # add thrust pitching moment to total CM
 
     # --- Penalty & feasibility (vectorized where possible) ---
     penalty = np.zeros(n)

@@ -265,14 +265,24 @@ class AeroEvaluator:
             except Exception:
                 pass
 
-        # ── Propulsion balance (installed thrust) ──
+        # ── Propulsion balance (installed thrust with vector decomposition) ──
         drag_force = cd_effective * mission.dynamic_pressure * s_ref
-        prop = compute_propulsion_balance(drag_force, mission.velocity,
-                                          mission.edf, mission.battery,
-                                          pr_total=pr_total)
+        _x_cg_prop = x_cg if x_cg is not None else params.body_root_chord * 0.30
+        prop = compute_propulsion_balance(
+            drag_force, mission.velocity,
+            mission.edf, mission.battery,
+            pr_total=pr_total,
+            alpha_deg=alpha_eq,
+            x_thrust=_duct_placement.exhaust_x if _duct_placement else 0.0,
+            z_thrust=_duct_placement.exhaust_z if _duct_placement else 0.0,
+            x_cg=_x_cg_prop,
+            z_cg=cg_result["z_cg"] if cg_result and "z_cg" in cg_result else 0.0,
+            q_S_c=mission.dynamic_pressure * s_ref * mac,
+        )
         t_available = prop["T_available"]
         t_over_d = prop["T_over_D"]
         endurance_s = prop["endurance_s"]
+        cm_thrust = prop.get("CM_thrust", 0.0)
 
         # ── Duct clearance ──
         duct_ok, min_duct_clearance_mm, _placement = compute_duct_clearance(
@@ -282,9 +292,10 @@ class AeroEvaluator:
         manuf = compute_manufacturability(params)
         manuf_score = manuf["manufacturability_score"]
 
-        # ── Feasibility ──
+        # ── Feasibility (CM includes thrust pitching moment) ──
+        cm_total = cm + cm_thrust
         is_feasible = fc.is_feasible(
-            static_margin, cm, struct_mass, mission.mass_budget,
+            static_margin, cm_total, struct_mass, mission.mass_budget,
             cl_required, ar, internal_volume, cn_beta,
             t_over_d, endurance_s,
             success=success,
@@ -296,7 +307,7 @@ class AeroEvaluator:
             bump_height_mm=bump["max_height_mm"],
         )
         penalty, constraints = fc.compute_penalty(
-            static_margin, cm, struct_mass, mission.mass_budget,
+            static_margin, cm_total, struct_mass, mission.mass_budget,
             cl_required, ar, internal_volume, cn_beta,
             t_over_d, endurance_s,
             vs=vs, alpha_trim=alpha_eq,
@@ -323,7 +334,9 @@ class AeroEvaluator:
             "CDi": cd_induced,
             "CD_trim": cd_trim,
             "CD_effective": cd_effective,
-            "CM": cm,
+            "CM": cm_total,
+            "CM_aero": cm,
+            "CM_thrust": cm_thrust,
             "L_over_D": l_over_d,
             "alpha_eq": alpha_eq,
             "CL_required": cl_required,
@@ -352,6 +365,9 @@ class AeroEvaluator:
             # Propulsion
             "T_over_D": t_over_d,
             "T_available": t_available,
+            "T_axial": prop.get("T_axial", t_available),
+            "T_normal": prop.get("T_normal", 0.0),
+            "M_thrust": prop.get("M_thrust", 0.0),
             "drag_force": drag_force,
             "P_elec": prop["P_elec"],
             "endurance_s": endurance_s,

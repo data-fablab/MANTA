@@ -63,16 +63,17 @@ class ServoConfig:
 class DuctGeometryConfig:
     """Duct geometry sizing — physics-based parameters.
 
-    Ref: NACA RM-A7I30 (intake), Seddon & Goldsmith (S-duct).
+    Ref: Seddon & Goldsmith (intake, S-duct).
     """
-    # Intake
+    # Intake (semi-circular lip scoop)
     intake_capture_ratio: float = 1.25
-    intake_ramp_angle_deg: float = 6.0
+    intake_length_frac: float = 0.10         # intake length as fraction of chord
     intake_width_depth_ratio: float = 4.0
     intake_min_body_margin_mm: float = 10.0
     # S-duct
     max_offset_length_ratio: float = 0.25
     sduct_area_ratio: float = 1.1
+    min_sduct_length_factor: float = 1.0     # min S-duct length = factor × duct_od_struct
     # Fan
     fan_clearance_min_mm: float = 5.0
     # Nozzle
@@ -80,7 +81,7 @@ class DuctGeometryConfig:
     exhaust_x_frac: float = 0.93
     # Structure
     duct_wall_mm: float = 1.2
-    housing_length_factor: float = 1.5
+    housing_length_factor: float = 1.0       # housing = factor × fan_diameter
     material_density: float = 1500.0
     structural_adder: float = 1.25
 
@@ -173,7 +174,7 @@ def feasibility_from_config(cfg: dict) -> FeasibilityConfig:
                 "drag_margin", "vs_max", "cl_max_clean", "alpha_trim_max",
                 "elevon_deflection_max", "cl_beta_cn_beta_max",
                 "servo_torque_max_kgcm",
-                "manufacturability_min", "bump_max_mm"]:
+                "manufacturability_min"]:
         if key in f:
             kwargs[key] = f[key]
     # Map weight keys

@@ -79,6 +79,9 @@ def export_aircraft_stl(params: BWBParams, path: str, n_profile: int = 30,
     dense_right = _spline_loft_sections(all_sections, all_t, n_interp,
                                         symmetric_root=True)
 
+    # Reverse point order so cross-product normals point outward (+Y)
+    dense_right = [sec[::-1] for sec in dense_right]
+
     # ── Mirror for left side ──
     dense_left = [_mirror_section(sec) for sec in dense_right]
 
@@ -97,8 +100,8 @@ def export_aircraft_stl(params: BWBParams, path: str, n_profile: int = 30,
     _cap_section(dense_right[-1], triangles, flip=False)
     _cap_section(dense_left[-1], triangles, flip=True)
 
-    # Root cap (centerline, y=0)
-    _cap_section(dense_right[0], triangles, flip=True)
+    # No root cap: left and right lofts share the y=0 section,
+    # closing the surface at the symmetry plane.
 
     # Propulsion duct geometry
     if include_propulsion:

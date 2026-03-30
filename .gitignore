@@ -20,6 +20,9 @@ output/
 data/
 models/
 
+# Tests (work in progress)
+tests/
+
 # Claude Code local config
 .claude/
 

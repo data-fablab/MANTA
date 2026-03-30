@@ -84,7 +84,7 @@ controls:
     sgn_dup: -1.0           # antisymmetric (roll)
 
 avl:
-  command: "d:/UAV/tools/avl/avl.exe"
+  command: "avl"
   chordwise_res: 6
   spanwise_res: 20              # >=16 required for eta=0.55 short segment
   timeout: 10.0
